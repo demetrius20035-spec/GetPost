@@ -8,14 +8,16 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from .. import http_client, models
+from .. import curl, http_client, models
 from ..qtcompat import QtCore, QtGui, QtWidgets
 from ..runner import RequestRunner
 from ..storage import Storage, build_default_workspace
-from .dialogs import VariablesDialog
+from .dialogs import CurlExportDialog, EnvironmentsDialog, ImportCurlDialog
 from .request_editor import RequestEditor
 from .response_view import ResponseView
 from .sidebar import Sidebar
+
+_URL_HISTORY_LIMIT = 50
 
 # Задержка автосохранения (мс) — изменения объединяются в одну запись.
 _AUTOSAVE_DELAY_MS = 500
@@ -31,6 +33,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workspaces: List[models.Workspace] = []
         self.current_ws: Optional[models.Workspace] = None
         self._runner: Optional[RequestRunner] = None
+        # История ответов по id запроса (только в памяти).
+        self._history: dict = {}
+        self._sending_req: Optional[models.Request] = None
 
         self.setWindowTitle("GetPost — HTTP-клиент")
         self.resize(1200, 720)
@@ -53,6 +58,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.editor = RequestEditor()
         self.response = ResponseView()
 
+        # Автодополнение URL по истории отправленных адресов.
+        self._url_model = QtCore.QStringListModel(self.settings.get("url_history", []))
+        completer = QtWidgets.QCompleter(self._url_model, self)
+        completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+        self.editor.url_edit.setCompleter(completer)
+
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         self.splitter.addWidget(self.sidebar)
         self.splitter.addWidget(self.editor)
@@ -71,7 +83,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         file_menu = menubar.addMenu("Файл")
         file_menu.addAction("Новое рабочее пространство", self.new_workspace)
-        file_menu.addAction("Переменные…", self.edit_variables)
+        file_menu.addAction("Окружения и переменные…", self.edit_variables)
+        save_action = file_menu.addAction("Сохранить сейчас", self._flush_save)
+        save_action.setShortcut("Ctrl+S")
         file_menu.addSeparator()
         reset_action = file_menu.addAction("Сбросить конфигурацию…", self.reset_config)
         reset_action.setStatusTip("Удалить все рабочие пространства и настройки")
@@ -84,13 +98,19 @@ class MainWindow(QtWidgets.QMainWindow):
         ws_menu.addAction("Переименовать", self.rename_workspace)
         ws_menu.addAction("Удалить", self.delete_workspace)
         ws_menu.addSeparator()
-        ws_menu.addAction("Переменные…", self.edit_variables)
+        ws_menu.addAction("Окружения и переменные…", self.edit_variables)
 
         req_menu = menubar.addMenu("Запрос")
         send_action = req_menu.addAction("Отправить", self._on_send)
         send_action.setShortcut(QtGui.QKeySequence("Ctrl+Return"))
-        req_menu.addAction("Новый запрос", self.sidebar.add_request)
-        req_menu.addAction("Новая папка", self.sidebar.add_folder)
+        new_req_action = req_menu.addAction("Новый запрос", self.sidebar.add_request)
+        new_req_action.setShortcut("Ctrl+N")
+        new_folder_action = req_menu.addAction("Новая папка", self.sidebar.add_folder)
+        new_folder_action.setShortcut("Ctrl+Shift+N")
+        dup_action = req_menu.addAction("Дублировать", self.sidebar.duplicate_current)
+        dup_action.setShortcut("Ctrl+D")
+        req_menu.addSeparator()
+        req_menu.addAction("Импорт из cURL…", self.import_curl)
 
         help_menu = menubar.addMenu("Справка")
         help_menu.addAction("О программе", self._show_about)
@@ -100,6 +120,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.request_selected.connect(self._on_request_selected)
         self.sidebar.structure_changed.connect(self._schedule_save)
         self.sidebar.item_renamed.connect(self._on_item_renamed)
+        self.sidebar.copy_curl_requested.connect(self._on_copy_curl)
+        self.sidebar.environment_switched.connect(self._on_env_switched)
         self.sidebar.workspace_switched.connect(self.switch_workspace)
         self.sidebar.new_workspace_requested.connect(self.new_workspace)
         self.sidebar.rename_workspace_requested.connect(self.rename_workspace)
@@ -200,11 +222,43 @@ class MainWindow(QtWidgets.QMainWindow):
     def edit_variables(self) -> None:
         if self.current_ws is None:
             return
-        dialog = VariablesDialog(self.current_ws.variables, self)
+        dialog = EnvironmentsDialog(self.current_ws, self)
         if dialog.exec():
-            self.current_ws.variables = dialog.variables()
+            envs = dialog.environments()
+            self.current_ws.environments = envs or {models.DEFAULT_ENV: {}}
+            self.current_ws.set_active_env(dialog.active())
+            if self.current_ws.active_env not in self.current_ws.environments:
+                self.current_ws.active_env = next(iter(self.current_ws.environments))
             self.storage.save_workspace(self.current_ws)
-            self.status.showMessage("Переменные сохранены", 3000)
+            self.sidebar.set_environments(self.current_ws)
+            self.status.showMessage("Окружения сохранены", 3000)
+
+    def _on_env_switched(self, name: str) -> None:
+        if self.current_ws is None:
+            return
+        self.current_ws.set_active_env(name)
+        self._schedule_save()
+        self.status.showMessage(f"Активное окружение: {name}", 3000)
+
+    def _on_copy_curl(self, req) -> None:
+        if req is None or self.current_ws is None:
+            return
+        try:
+            command = curl.to_curl(req, self.current_ws.variables)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "Copy as cURL", f"Не удалось сформировать команду: {exc}")
+            return
+        CurlExportDialog(command, self).exec()
+
+    def import_curl(self) -> None:
+        if self.current_ws is None:
+            return
+        dialog = ImportCurlDialog(self)
+        if dialog.exec():
+            req = dialog.request()
+            if req is not None:
+                self.sidebar.add_imported_request(req)
+                self.status.showMessage(f"Импортирован запрос: {req.method} {req.url}", 4000)
 
     def reset_config(self) -> None:
         reply = QtWidgets.QMessageBox.warning(
@@ -231,6 +285,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_request_selected(self, req) -> None:
         self.editor.set_request(req)
+        # Показываем историю ответов выбранного запроса (если есть).
+        history = self._history.get(req.id) if req is not None else None
+        if history:
+            self.response.show_response(history[-1], history)
+        else:
+            self.response.clear()
 
     # -- автосохранение -----------------------------------------------------
     def _schedule_save(self) -> None:
@@ -263,21 +323,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self.response.show_error("URL пуст. Укажите адрес запроса.")
             return
 
+        # Параметры выполнения уровня запроса.
+        kwargs["allow_redirects"] = req.follow_redirects
+        kwargs["verify"] = req.verify_ssl
+        if not req.verify_ssl:
+            try:
+                import urllib3
+
+                urllib3.disable_warnings()
+            except Exception:
+                pass
+        timeout = req.timeout if req.timeout else self.timeout
+
         self.response.show_loading()
         self.editor.set_sending(True)
         self.status.showMessage(f"Отправка {method} {url}…")
+        self._sending_req = req
+        self._add_url_history(url)
 
-        self._runner = RequestRunner(method, url, kwargs, timeout=self.timeout, parent=self)
+        self._runner = RequestRunner(method, url, kwargs, timeout=timeout, parent=self)
         self._runner.succeeded.connect(self._on_response)
         self._runner.failed.connect(self._on_request_error)
         self._runner.finished.connect(self._on_runner_finished)
         self._runner.start()
 
     def _on_response(self, data) -> None:
-        self.response.show_response(data)
+        if self._sending_req is not None:
+            history = self._history.setdefault(self._sending_req.id, [])
+            history.append(data)
+            if len(history) > 15:
+                del history[0]
+            self.response.show_response(data, history)
+        else:
+            self.response.show_response(data)
         self.status.showMessage(
             f"{data.status_line} · {data.elapsed_ms:.0f} мс", 5000
         )
+
+    def _add_url_history(self, url: str) -> None:
+        if not url:
+            return
+        history = self.settings.get("url_history", [])
+        if url in history:
+            history.remove(url)
+        history.insert(0, url)
+        del history[_URL_HISTORY_LIMIT:]
+        self.settings["url_history"] = history
+        self._url_model.setStringList(history)
 
     def _on_request_error(self, message: str) -> None:
         self.response.show_error(message)

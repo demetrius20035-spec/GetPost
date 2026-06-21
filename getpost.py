@@ -249,10 +249,13 @@ def send_request(req: models.Request, variables: dict, args, multipart_items=Non
         kwargs["files"] = build_multipart_files(multipart_items, variables)
         kwargs.pop("data", None)
 
-    kwargs["allow_redirects"] = not args.no_redirect
-    kwargs["verify"] = not args.insecure
+    # Учитываем сохранённые в запросе опции; флаги CLI могут их ужесточить.
+    kwargs["allow_redirects"] = req.follow_redirects and not args.no_redirect
+    kwargs["verify"] = req.verify_ssl and not args.insecure
     if args.proxy:
         kwargs["proxies"] = {"http": args.proxy, "https": args.proxy}
+    # Тайм-аут: приоритет у сохранённого в запросе значения.
+    timeout = req.timeout if req.timeout else args.timeout
 
     if args.insecure:
         try:
@@ -264,9 +267,9 @@ def send_request(req: models.Request, variables: dict, args, multipart_items=Non
         _print_request(method, url, kwargs)
 
     try:
-        resp = requests.request(method, url, timeout=args.timeout, stream=bool(args.output), **kwargs)
+        resp = requests.request(method, url, timeout=timeout, stream=bool(args.output), **kwargs)
     except requests.exceptions.Timeout:
-        info(_c(f"Ошибка: превышено время ожидания ({args.timeout} с)", Ansi.RED))
+        info(_c(f"Ошибка: превышено время ожидания ({timeout} с)", Ansi.RED))
         return EXIT_REQUEST
     except requests.exceptions.SSLError as exc:
         info(_c(f"Ошибка SSL: {exc}", Ansi.RED))
@@ -404,6 +407,12 @@ def cmd_run(args) -> int:
         info("Доступные: " + (names or "—"))
         return EXIT_ERROR
 
+    if getattr(args, "env", None):
+        if args.env in ws.environments:
+            ws.set_active_env(args.env)
+        else:
+            info(_c(f"Окружение «{args.env}» не найдено. Доступные: {', '.join(ws.env_names())}", Ansi.YELLOW))
+
     matches = find_request(ws, args.request)
     if not matches:
         info(_c(f"Запрос «{args.request}» не найден в «{ws.name}».", Ansi.RED))
@@ -450,8 +459,12 @@ def cmd_ls(args) -> int:
         return EXIT_ERROR
 
     info(_c(f"Workspace: {ws.name}", Ansi.BOLD))
+    envs = ws.env_names()
+    if len(envs) > 1 or envs != ["Default"]:
+        marked = ", ".join((f"★{n}" if n == ws.active_env else n) for n in envs)
+        info(_c(f"Окружения: {marked}", Ansi.BOLD))
     if ws.variables:
-        info(_c("Переменные:", Ansi.BOLD))
+        info(_c(f"Переменные ({ws.active_env}):", Ansi.BOLD))
         for k, v in ws.variables.items():
             print(f"  {_c(k, Ansi.CYAN)} = {v}")
     info(_c("Запросы:", Ansi.BOLD))
@@ -519,6 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="отправить сохранённый в Workspace запрос")
     p_run.add_argument("workspace", help="имя или id рабочего пространства")
     p_run.add_argument("request", help="имя или путь запроса (Папка/Имя)")
+    p_run.add_argument("--env", metavar="NAME", help="окружение Workspace (по умолчанию активное)")
     _add_request_options(p_run)
     p_run.set_defaults(func=cmd_run)
 

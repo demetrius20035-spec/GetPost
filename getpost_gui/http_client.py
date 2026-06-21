@@ -33,6 +33,8 @@ class ResponseData:
         url: str,
         content_type: str,
         ok: bool,
+        content: bytes = b"",
+        cookies: Optional[List[Tuple[str, str]]] = None,
     ):
         self.status_code = status_code
         self.reason = reason
@@ -43,6 +45,8 @@ class ResponseData:
         self.url = url
         self.content_type = content_type
         self.ok = ok
+        self.content = content
+        self.cookies = cookies or []
 
     @property
     def status_line(self) -> str:
@@ -145,7 +149,8 @@ def perform_prepared(
     caller = session if session is not None else requests
     start = time.perf_counter()
     resp = caller.request(method, url, timeout=timeout, **kwargs)
-    text = resp.text  # принудительно читаем тело в этом потоке
+    content = resp.content  # принудительно читаем тело в этом потоке
+    text = resp.text
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
     return ResponseData(
@@ -154,10 +159,12 @@ def perform_prepared(
         headers=list(resp.headers.items()),
         text=text,
         elapsed_ms=elapsed_ms,
-        size_bytes=len(resp.content),
+        size_bytes=len(content),
         url=resp.url,
         content_type=resp.headers.get("Content-Type", ""),
         ok=resp.ok,
+        content=content,
+        cookies=list(resp.cookies.items()),
     )
 
 

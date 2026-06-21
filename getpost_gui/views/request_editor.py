@@ -73,6 +73,7 @@ class RequestEditor(QtWidgets.QWidget):
         self.tabs.addTab(self.headers_table, "Headers")
         self.tabs.addTab(self._build_body_tab(), "Body")
         self.tabs.addTab(self._build_auth_tab(), "Auth")
+        self.tabs.addTab(self._build_options_tab(), "Options")
         layout.addWidget(self.tabs, 1)
 
     def _build_body_tab(self) -> QtWidgets.QWidget:
@@ -168,6 +169,32 @@ class RequestEditor(QtWidgets.QWidget):
         v.addStretch(1)
         return page
 
+    def _build_options_tab(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(page)
+        v.setContentsMargins(8, 8, 8, 8)
+
+        self.follow_check = QtWidgets.QCheckBox("Следовать редиректам")
+        self.follow_check.setChecked(True)
+        self.verify_check = QtWidgets.QCheckBox("Проверять TLS-сертификат")
+        self.verify_check.setChecked(True)
+        v.addWidget(self.follow_check)
+        v.addWidget(self.verify_check)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Тайм-аут (с):"))
+        self.timeout_spin = QtWidgets.QDoubleSpinBox()
+        self.timeout_spin.setRange(0.0, 3600.0)
+        self.timeout_spin.setDecimals(1)
+        self.timeout_spin.setSingleStep(1.0)
+        self.timeout_spin.setSpecialValueText("по умолчанию")  # отображается при 0
+        self.timeout_spin.setToolTip("0 — использовать глобальный тайм-аут")
+        row.addWidget(self.timeout_spin)
+        row.addStretch(1)
+        v.addLayout(row)
+        v.addStretch(1)
+        return page
+
     # -- сигналы ------------------------------------------------------------
     def _connect_signals(self) -> None:
         self.send_btn.clicked.connect(self.send_requested.emit)
@@ -175,10 +202,16 @@ class RequestEditor(QtWidgets.QWidget):
 
         self.name_edit.textEdited.connect(self._on_name_edited)
         self.method_combo.currentIndexChanged.connect(self._on_changed)
-        self.url_edit.textChanged.connect(self._on_changed)
+        # textEdited — только пользовательский ввод (программный setText не триггерит),
+        # что важно для синхронизации URL ↔ Params без зацикливания.
+        self.url_edit.textEdited.connect(self._on_url_edited)
 
-        self.params_table.changed.connect(self._on_changed)
+        self.params_table.changed.connect(self._on_params_changed)
         self.headers_table.changed.connect(self._on_changed)
+
+        self.follow_check.toggled.connect(self._on_changed)
+        self.verify_check.toggled.connect(self._on_changed)
+        self.timeout_spin.valueChanged.connect(self._on_changed)
 
         self.body_type_combo.currentIndexChanged.connect(self._on_body_type_changed)
         self.raw_lang_combo.currentIndexChanged.connect(self._on_raw_lang_changed)
@@ -211,6 +244,9 @@ class RequestEditor(QtWidgets.QWidget):
                 self.urlencoded_table.set_items([])
                 self.body_type_combo.setCurrentIndex(0)
                 self.auth_type_combo.setCurrentIndex(0)
+                self.follow_check.setChecked(True)
+                self.verify_check.setChecked(True)
+                self.timeout_spin.setValue(0.0)
                 return
 
             self.name_edit.setText(req.name)
@@ -233,6 +269,10 @@ class RequestEditor(QtWidgets.QWidget):
             self.basic_pass_edit.setText(req.auth_basic_password)
             self.bearer_token_edit.setText(req.auth_bearer_token)
             self._update_auth_stack()
+
+            self.follow_check.setChecked(req.follow_redirects)
+            self.verify_check.setChecked(req.verify_ssl)
+            self.timeout_spin.setValue(req.timeout or 0.0)
         finally:
             self._loading = False
 
@@ -278,6 +318,11 @@ class RequestEditor(QtWidgets.QWidget):
         r.auth_basic_password = self.basic_pass_edit.text()
         r.auth_bearer_token = self.bearer_token_edit.text()
 
+        r.follow_redirects = self.follow_check.isChecked()
+        r.verify_ssl = self.verify_check.isChecked()
+        timeout = self.timeout_spin.value()
+        r.timeout = timeout if timeout > 0 else None
+
     # -- обработчики --------------------------------------------------------
     def _on_changed(self) -> None:
         if self._loading or self._req is None:
@@ -291,6 +336,45 @@ class RequestEditor(QtWidgets.QWidget):
         self._req.name = text
         self.name_changed.emit(self._req)
         self.modified.emit()
+
+    # -- синхронизация URL <-> Query Params --------------------------------
+    def _on_url_edited(self, *_args) -> None:
+        """Пользователь правит URL → обновляем таблицу Params из query-строки."""
+        if self._loading:
+            return
+        self._sync_params_from_url()
+        self._on_changed()
+
+    def _on_params_changed(self) -> None:
+        """Изменились Params → пересобираем query-строку в URL."""
+        if self._loading:
+            return
+        self._sync_url_from_params()
+        self._on_changed()
+
+    def _sync_params_from_url(self) -> None:
+        text = self.url_edit.text()
+        _, _, query = text.partition("?")
+        items = []
+        if query:
+            for part in query.split("&"):
+                if not part:
+                    continue
+                key, _, value = part.partition("=")
+                items.append({"enabled": True, "key": key, "value": value})
+        # set_items не порождает сигнал changed (защита _mutating в таблице).
+        self.params_table.set_items(items)
+
+    def _sync_url_from_params(self) -> None:
+        base = self.url_edit.text().partition("?")[0]
+        pairs = []
+        for it in self.params_table.get_items():
+            if it.get("enabled", True) and str(it.get("key", "")).strip():
+                pairs.append(f"{it['key']}={it['value']}")
+        new_url = base + ("?" + "&".join(pairs) if pairs else "")
+        if new_url != self.url_edit.text():
+            # Программный setText не вызывает textEdited → рекурсии нет.
+            self.url_edit.setText(new_url)
 
     def _on_body_type_changed(self) -> None:
         # form-data и urlencoded используют одно поле модели (body_form), но

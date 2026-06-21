@@ -9,11 +9,83 @@ from __future__ import annotations
 from typing import List, Optional, Tuple, Union
 
 from .. import models
-from ..qtcompat import Qt, QtWidgets, Signal
+from ..qtcompat import Qt, QtGui, QtWidgets, Signal
 
 ROLE_OBJ = Qt.ItemDataRole.UserRole
 
 Container = Union[models.Workspace, models.Folder]
+
+
+class _RequestTree(QtWidgets.QTreeWidget):
+    """Дерево с drag&drop, не нарушающим лимит вложенности папок."""
+
+    dropped = Signal()
+
+    @staticmethod
+    def _is_folder(item) -> bool:
+        return item is not None and isinstance(item.data(0, ROLE_OBJ), models.Folder)
+
+    @staticmethod
+    def _depth(item) -> int:
+        depth = 0
+        while item is not None:
+            depth += 1
+            item = item.parent()
+        return depth
+
+    def _folder_height(self, item) -> int:
+        subs = [
+            self._folder_height(item.child(i))
+            for i in range(item.childCount())
+            if self._is_folder(item.child(i))
+        ]
+        return 1 + (max(subs) if subs else 0)
+
+    @staticmethod
+    def _is_ancestor(ancestor, item) -> bool:
+        node = item
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent()
+        return False
+
+    def _drop_allowed(self, event) -> bool:
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        target = self.itemAt(pos)
+        indicator = self.dropIndicatorPosition()
+        Pos = QtWidgets.QAbstractItemView.DropIndicatorPosition
+
+        # Нельзя бросать элемент внутрь запроса.
+        if indicator == Pos.OnItem and target is not None and not self._is_folder(target):
+            return False
+
+        # Определяем глубину контейнера, куда попадут перемещаемые элементы.
+        if indicator == Pos.OnItem and self._is_folder(target):
+            container_depth = self._depth(target)
+            container_item = target
+        elif target is not None and indicator in (Pos.AboveItem, Pos.BelowItem):
+            container_item = target.parent()
+            container_depth = self._depth(container_item)  # 0, если верхний уровень
+        else:
+            container_item = None
+            container_depth = 0
+
+        for it in self.selectedItems():
+            # Запрет циклов: нельзя вложить папку в саму себя/потомка.
+            if container_item is not None and self._is_ancestor(it, container_item):
+                return False
+            if self._is_folder(it):
+                if container_depth + self._folder_height(it) > models.MAX_FOLDER_DEPTH:
+                    return False
+        return True
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - имя задано Qt
+        if not self._drop_allowed(event):
+            event.ignore()
+            return
+        super().dropEvent(event)
+        self.dropped.emit()
 
 
 class Sidebar(QtWidgets.QWidget):
@@ -22,6 +94,8 @@ class Sidebar(QtWidgets.QWidget):
     request_selected = Signal(object)        # выбран Request
     structure_changed = Signal()             # изменилось дерево → автосохранение
     item_renamed = Signal(object)            # переименован объект (Folder/Request)
+    copy_curl_requested = Signal(object)     # «Copy as cURL» для запроса
+    environment_switched = Signal(str)       # выбрано другое окружение
     workspace_switched = Signal(str)         # выбран другой Workspace (по id)
     new_workspace_requested = Signal()
     rename_workspace_requested = Signal()
@@ -62,6 +136,15 @@ class Sidebar(QtWidgets.QWidget):
         ws_row.addWidget(self.ws_menu_btn)
         layout.addLayout(ws_row)
 
+        # Выбор активного окружения.
+        env_row = QtWidgets.QHBoxLayout()
+        env_row.addWidget(QtWidgets.QLabel("Окружение:"))
+        self.env_combo = QtWidgets.QComboBox()
+        self.env_combo.setToolTip("Активное окружение переменных")
+        self.env_combo.currentIndexChanged.connect(self._on_env_combo_changed)
+        env_row.addWidget(self.env_combo, 1)
+        layout.addLayout(env_row)
+
         # Кнопки создания папок/запросов.
         btn_row = QtWidgets.QHBoxLayout()
         self.add_folder_btn = QtWidgets.QToolButton()
@@ -78,14 +161,24 @@ class Sidebar(QtWidgets.QWidget):
         layout.addLayout(btn_row)
 
         # Дерево.
-        self.tree = QtWidgets.QTreeWidget()
+        self.tree = _RequestTree()
         self.tree.setHeaderHidden(True)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.setDragEnabled(True)
+        self.tree.setAcceptDrops(True)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
         self.tree.currentItemChanged.connect(self._on_current_item_changed)
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.tree.dropped.connect(self._on_dropped)
         layout.addWidget(self.tree, 1)
+
+        # Удаление по клавише Delete.
+        del_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Delete), self.tree)
+        del_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        del_shortcut.activated.connect(self._delete_current)
 
     # -- работа с Workspace -------------------------------------------------
     def set_workspaces(self, workspaces: List[models.Workspace], current_id: Optional[str]) -> None:
@@ -106,12 +199,29 @@ class Sidebar(QtWidgets.QWidget):
                 self.ws_combo.blockSignals(True)
                 self.ws_combo.setCurrentIndex(idx)
                 self.ws_combo.blockSignals(False)
+        self.set_environments(ws)
         self._rebuild_tree()
+
+    def set_environments(self, ws: Optional[models.Workspace]) -> None:
+        self.env_combo.blockSignals(True)
+        self.env_combo.clear()
+        if ws is not None:
+            for name in ws.env_names():
+                self.env_combo.addItem(name)
+            idx = self.env_combo.findText(ws.active_env)
+            if idx >= 0:
+                self.env_combo.setCurrentIndex(idx)
+        self.env_combo.blockSignals(False)
 
     def _on_ws_combo_changed(self, index: int) -> None:
         ws_id = self.ws_combo.itemData(index)
         if ws_id:
             self.workspace_switched.emit(ws_id)
+
+    def _on_env_combo_changed(self, index: int) -> None:
+        name = self.env_combo.itemText(index)
+        if name:
+            self.environment_switched.emit(name)
 
     # -- построение дерева --------------------------------------------------
     def _rebuild_tree(self) -> None:
@@ -294,9 +404,80 @@ class Sidebar(QtWidgets.QWidget):
         menu.addAction("Новая папка", self.add_folder)
         if obj is not None:
             menu.addSeparator()
+            menu.addAction("Дублировать", lambda: self._duplicate_item(item))
+            if isinstance(obj, models.Request):
+                menu.addAction("Copy as cURL", lambda: self.copy_curl_requested.emit(obj))
             menu.addAction("Переименовать", lambda: self.tree.editItem(item, 0))
             menu.addAction("Удалить", lambda: self._delete_item(item))
         menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    # -- дублирование / drag&drop ------------------------------------------
+    def _duplicate_item(self, item) -> None:
+        obj = self._obj_of(item)
+        if obj is None or self._ws is None:
+            return
+        container = self._container_of_item(item)
+        parent_item = item.parent()
+        if isinstance(obj, models.Folder):
+            clone = obj.clone()
+            container.folders.append(clone)
+            new_item = self._add_folder_item(parent_item, clone)
+        else:
+            clone = obj.clone()
+            container.requests.append(clone)
+            new_item = self._add_request_item(parent_item, clone)
+        if parent_item is not None:
+            parent_item.setExpanded(True)
+        self.tree.setCurrentItem(new_item)
+        self.structure_changed.emit()
+
+    def _delete_current(self) -> None:
+        item = self.tree.currentItem()
+        if item is not None:
+            self._delete_item(item)
+
+    def duplicate_current(self) -> None:
+        item = self.tree.currentItem()
+        if item is not None:
+            self._duplicate_item(item)
+
+    def add_imported_request(self, req: models.Request) -> None:
+        """Добавить готовый запрос (например, импортированный из cURL)."""
+        if self._ws is None:
+            return
+        container, parent_item = self._target_for_new()
+        container.requests.append(req)
+        new_item = self._add_request_item(parent_item, req)
+        if parent_item is not None:
+            parent_item.setExpanded(True)
+        self.tree.setCurrentItem(new_item)
+        self.structure_changed.emit()
+
+    def _on_dropped(self) -> None:
+        self._rebuild_model_from_tree()
+        self.tree.expandAll()
+        self.structure_changed.emit()
+
+    def _rebuild_model_from_tree(self) -> None:
+        """Перестроить модель Workspace по текущему виду дерева (после DnD)."""
+        if self._ws is None:
+            return
+        self._ws.folders = []
+        self._ws.requests = []
+
+        def collect(parent_item, container: Container) -> None:
+            for i in range(parent_item.childCount()):
+                it = parent_item.child(i)
+                obj = self._obj_of(it)
+                if isinstance(obj, models.Folder):
+                    obj.folders = []
+                    obj.requests = []
+                    container.folders.append(obj)
+                    collect(it, obj)
+                elif isinstance(obj, models.Request):
+                    container.requests.append(obj)
+
+        collect(self.tree.invisibleRootItem(), self._ws)
 
     # -- выделение ----------------------------------------------------------
     def _on_current_item_changed(self, current, previous) -> None:

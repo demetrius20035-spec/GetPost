@@ -92,6 +92,10 @@ class Request:
         self.auth_basic_username: str = ""
         self.auth_basic_password: str = ""
         self.auth_bearer_token: str = ""
+        # Параметры выполнения (per-request). timeout=None → глобальный.
+        self.follow_redirects: bool = True
+        self.verify_ssl: bool = True
+        self.timeout: Optional[float] = None
 
     # -- сериализация -------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -110,6 +114,9 @@ class Request:
             "auth_basic_username": self.auth_basic_username,
             "auth_basic_password": self.auth_basic_password,
             "auth_bearer_token": self.auth_bearer_token,
+            "follow_redirects": self.follow_redirects,
+            "verify_ssl": self.verify_ssl,
+            "timeout": self.timeout,
         }
 
     @classmethod
@@ -127,7 +134,18 @@ class Request:
         r.auth_basic_username = str(d.get("auth_basic_username", ""))
         r.auth_basic_password = str(d.get("auth_basic_password", ""))
         r.auth_bearer_token = str(d.get("auth_bearer_token", ""))
+        r.follow_redirects = bool(d.get("follow_redirects", True))
+        r.verify_ssl = bool(d.get("verify_ssl", True))
+        timeout = d.get("timeout")
+        r.timeout = float(timeout) if isinstance(timeout, (int, float)) else None
         return r
+
+    def clone(self, new_name: Optional[str] = None) -> "Request":
+        """Создать копию запроса с новым идентификатором."""
+        copy = Request.from_dict(self.to_dict())
+        copy.id = new_id()
+        copy.name = new_name if new_name is not None else f"{self.name} (копия)"
+        return copy
 
 
 class Folder:
@@ -154,25 +172,93 @@ class Folder:
         f.requests = [Request.from_dict(x) for x in d.get("requests", []) if isinstance(x, dict)]
         return f
 
+    def clone(self, new_name: Optional[str] = None) -> "Folder":
+        """Создать глубокую копию папки с новыми идентификаторами."""
+        copy = Folder.from_dict(self.to_dict())
+
+        def reassign(folder: "Folder") -> None:
+            folder.id = new_id()
+            for req in folder.requests:
+                req.id = new_id()
+            for sub in folder.folders:
+                reassign(sub)
+
+        reassign(copy)
+        copy.name = new_name if new_name is not None else f"{self.name} (копия)"
+        return copy
+
+
+DEFAULT_ENV = "Default"
+
 
 class Workspace:
-    """Рабочее пространство — корень иерархии."""
+    """Рабочее пространство — корень иерархии.
+
+    Поддерживает несколько именованных окружений (environments), каждое со
+    своим набором переменных. Активное окружение доступно через свойство
+    ``variables`` (для совместимости с остальным кодом).
+    """
 
     def __init__(self, name: str = "My Workspace", id: Optional[str] = None):
         self.id: str = id or new_id()
         self.name: str = name
-        # Переменные окружения: {"base_url": "https://...", ...}
-        self.variables: Dict[str, str] = {}
+        # Окружения: {"Default": {"base_url": "..."}, "Prod": {...}}
+        self.environments: Dict[str, Dict[str, str]] = {DEFAULT_ENV: {}}
+        self.active_env: str = DEFAULT_ENV
         self.folders: List[Folder] = []
         self.requests: List[Request] = []
         # Путь к файлу на диске (заполняется хранилищем, не сериализуется).
         self.file_path: Optional[str] = None
 
+    # -- активное окружение / переменные ------------------------------------
+    @property
+    def variables(self) -> Dict[str, str]:
+        """Переменные активного окружения."""
+        return self.environments.setdefault(self.active_env, {})
+
+    @variables.setter
+    def variables(self, value: Dict[str, str]) -> None:
+        self.environments[self.active_env] = {str(k): str(v) for k, v in dict(value).items()}
+
+    def env_names(self) -> List[str]:
+        return list(self.environments.keys())
+
+    def set_active_env(self, name: str) -> None:
+        if name in self.environments:
+            self.active_env = name
+
+    def add_env(self, name: str) -> bool:
+        if name and name not in self.environments:
+            self.environments[name] = {}
+            return True
+        return False
+
+    def rename_env(self, old: str, new: str) -> bool:
+        if old in self.environments and new and new not in self.environments:
+            # Сохраняем порядок ключей.
+            self.environments = {
+                (new if k == old else k): v for k, v in self.environments.items()
+            }
+            if self.active_env == old:
+                self.active_env = new
+            return True
+        return False
+
+    def remove_env(self, name: str) -> bool:
+        if name in self.environments and len(self.environments) > 1:
+            del self.environments[name]
+            if self.active_env == name:
+                self.active_env = next(iter(self.environments))
+            return True
+        return False
+
+    # -- сериализация -------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
             "name": self.name,
-            "variables": self.variables,
+            "environments": self.environments,
+            "active_env": self.active_env,
             "folders": [f.to_dict() for f in self.folders],
             "requests": [r.to_dict() for r in self.requests],
         }
@@ -180,9 +266,24 @@ class Workspace:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Workspace":
         ws = cls(name=str(d.get("name", "My Workspace")), id=d.get("id"))
-        variables = d.get("variables", {})
-        if isinstance(variables, dict):
-            ws.variables = {str(k): str(v) for k, v in variables.items()}
+        envs = d.get("environments")
+        if isinstance(envs, dict) and envs:
+            ws.environments = {
+                str(k): {str(kk): str(vv) for kk, vv in (v or {}).items()}
+                for k, v in envs.items()
+                if isinstance(v, dict)
+            }
+            active = d.get("active_env")
+            ws.active_env = active if active in ws.environments else next(iter(ws.environments))
+        else:
+            # Миграция со старого формата (одиночное поле variables).
+            legacy = d.get("variables", {})
+            variables = {str(k): str(v) for k, v in legacy.items()} if isinstance(legacy, dict) else {}
+            ws.environments = {DEFAULT_ENV: variables}
+            ws.active_env = DEFAULT_ENV
+        if not ws.environments:
+            ws.environments = {DEFAULT_ENV: {}}
+            ws.active_env = DEFAULT_ENV
         ws.folders = [Folder.from_dict(x) for x in d.get("folders", []) if isinstance(x, dict)]
         ws.requests = [Request.from_dict(x) for x in d.get("requests", []) if isinstance(x, dict)]
         return ws
