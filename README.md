@@ -5,8 +5,9 @@
 отправлять их с произвольными параметрами и просматривать ответы с подсветкой
 синтаксиса.
 
-> В репозитории также есть консольная версия — [`getpost.py`](getpost.py)
-> (минимальный CLI для GET/POST). Основное приложение — графическое (ниже).
+> В репозитории также есть полноценный **консольный клиент** —
+> [`getpost.py`](getpost.py) (см. раздел [Консольный клиент (CLI)](#консольный-клиент-cli)).
+> Он использует то же ядро, что и GUI, и умеет запускать сохранённые в Workspace запросы.
 
 ## Возможности
 
@@ -96,6 +97,52 @@ GETPOST_CONFIG_DIR=./config python run_gui.py
 5. **Ответ** отображается справа: вкладки «Response» (тело, переключатель
    Pretty/Raw), «Headers», «Time».
 
+## Консольный клиент (CLI)
+
+`getpost.py` — функциональный HTTP-клиент для терминала, использующий то же
+ядро, что и GUI (сборка запроса, подстановка переменных, доступ к сохранённым
+Workspace).
+
+```bash
+python getpost.py <METHOD> <URL> [опции]     # или: python getpost.py send ...
+python getpost.py run <Workspace> <Запрос>   # запустить сохранённый запрос
+python getpost.py ls [Workspace]             # список Workspace / их содержимого
+```
+
+Основные возможности:
+
+- методы `GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS`;
+- заголовки `-H 'K: V'`, query-параметры `-q k=v` (повторяемые);
+- тело: `-d/--data` (в т.ч. `@file` и `@-` из stdin), `--json`,
+  `-F/--form` (urlencoded), `--multipart` (в т.ч. загрузка файла `k=@path`);
+- авторизация: `-u user:pass` (Basic), `--bearer TOKEN`;
+- переменные `--var k=v` для `{{подстановки}}` (или `--use-workspace NAME`);
+- управление: `--timeout`, `--no-redirect`, `-k/--insecure`, `--proxy`;
+- вывод: цветной JSON, `-i`/`-I` (заголовки), `-v` (детали запроса),
+  `-s` (тихо), `--raw`, `-o file` (сохранить тело), `--fail` (код возврата по HTTP-ошибке).
+
+Примеры:
+
+```bash
+# GET с красивым цветным JSON
+python getpost.py GET https://httpbin.org/get
+
+# POST с JSON и Bearer-токеном
+python getpost.py POST https://httpbin.org/post --json '{"a":1}' --bearer TOKEN
+
+# Переменные и заголовки
+python getpost.py GET '{{base}}/items' -H 'X-Key: 1' -q page=2 --var base=https://api.test
+
+# Загрузка файла (multipart)
+python getpost.py POST https://httpbin.org/post --multipart file=@./report.pdf
+
+# Запуск сохранённого запроса из Workspace (создан в GUI)
+python getpost.py ls
+python getpost.py run "My Workspace" "Get IP"
+```
+
+Полная справка — `python getpost.py --help` (и `... send --help`).
+
 ## Архитектура
 
 Проект построен по схеме **MVC** и разделён на независимые слои:
@@ -124,8 +171,9 @@ getpost_gui/
 
 ## Тесты
 
-Логика, не связанная с GUI, покрыта юнит-тестами (стандартный `unittest`,
-зависимостей сверх требований не нужно):
+Логика, не связанная с GUI (модели, хранилище, переменные, сборка запроса и
+парсинг CLI), покрыта юнит-тестами (стандартный `unittest`, зависимостей сверх
+требований не нужно):
 
 ```bash
 python -m unittest discover -s tests -v
