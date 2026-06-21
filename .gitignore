@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Локальная конфигурация приложения (по умолчанию хранится в ~/.getpost,
+# но игнорируем и локальный каталог config/ на случай GETPOST_CONFIG_DIR=./config)
+config/
+.getpost/
+
+# Прочее
+.DS_Store
+*.log
