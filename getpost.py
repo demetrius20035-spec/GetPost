@@ -49,13 +49,13 @@ import requests
 
 # Подключаем общее ядро из соседнего пакета (без зависимости от Qt).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from getpost_gui import http_client, models, storage  # noqa: E402
+from getpost_gui import http_client, models, share, storage  # noqa: E402
 from getpost_gui.variables import substitute  # noqa: E402
 
 __version__ = "2.0.0"
 
 HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
-SUBCOMMANDS = {"send", "run", "ls", "list"}
+SUBCOMMANDS = {"send", "run", "ls", "list", "export", "import"}
 
 # Коды возврата.
 EXIT_OK = 0
@@ -390,6 +390,18 @@ def find_request(ws, name_or_path: str):
     return matches
 
 
+def iter_folders(container, prefix=""):
+    """Перебрать все папки Workspace с их «путями»."""
+    for f in container.folders:
+        path = prefix + f.name
+        yield path, f
+        yield from iter_folders(f, path + "/")
+
+
+def find_folder(ws, name_or_path: str):
+    return [(p, f) for p, f in iter_folders(ws) if p == name_or_path or f.name == name_or_path]
+
+
 # --------------------------------------------------------------------------
 # Подкоманды
 # --------------------------------------------------------------------------
@@ -474,6 +486,70 @@ def cmd_ls(args) -> int:
     return EXIT_OK
 
 
+def cmd_export(args) -> int:
+    ws = find_workspace(args.workspace)
+    if ws is None:
+        info(_c(f"Рабочее пространство «{args.workspace}» не найдено.", Ansi.RED))
+        return EXIT_ERROR
+
+    obj = ws
+    if args.request:
+        matches = find_request(ws, args.request)
+        if len(matches) != 1:
+            info(_c(f"Запрос «{args.request}»: найдено совпадений — {len(matches)}.", Ansi.RED))
+            return EXIT_ERROR
+        obj = matches[0][1]
+    elif args.folder:
+        matches = find_folder(ws, args.folder)
+        if len(matches) != 1:
+            info(_c(f"Папка «{args.folder}»: найдено совпадений — {len(matches)}.", Ansi.RED))
+            return EXIT_ERROR
+        obj = matches[0][1]
+
+    text = share.export_str(obj)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        info(_c(f"Экспортировано ({share.detect_kind(obj)}) в {args.output}", Ansi.GREEN))
+    else:
+        print(text)
+    return EXIT_OK
+
+
+def cmd_import(args) -> int:
+    try:
+        with open(args.file, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        kind, obj = share.parse(text)
+    except (OSError, ValueError) as exc:
+        info(_c(f"Не удалось импортировать: {exc}", Ansi.RED))
+        return EXIT_ERROR
+
+    store = storage.Storage()
+    if kind == share.KIND_WORKSPACE:
+        names = {w.name for w in store.load_all_workspaces()}
+        if obj.name in names:
+            obj.name = f"{obj.name} (импорт)"
+        store.save_workspace(obj)
+        info(_c(f"Импортировано рабочее пространство «{obj.name}»", Ansi.GREEN))
+        return EXIT_OK
+
+    if not args.into:
+        info(_c("Для импорта папки/запроса укажите целевой Workspace через --into.", Ansi.RED))
+        return EXIT_ERROR
+    ws = find_workspace(args.into)
+    if ws is None:
+        info(_c(f"Рабочее пространство «{args.into}» не найдено.", Ansi.RED))
+        return EXIT_ERROR
+    if kind == share.KIND_FOLDER:
+        ws.folders.append(obj)
+    else:
+        ws.requests.append(obj)
+    store.save_workspace(ws)
+    info(_c(f"Импортировано ({kind}) в «{ws.name}»", Ansi.GREEN))
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------
 # Парсер аргументов
 # --------------------------------------------------------------------------
@@ -542,6 +618,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("--no-color", action="store_true", help="отключить цветной вывод")
     p_ls.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     p_ls.set_defaults(func=cmd_ls)
+
+    # export
+    p_export = sub.add_parser("export", help="экспортировать Workspace/папку/запрос в файл")
+    p_export.add_argument("workspace", help="имя или id рабочего пространства")
+    p_export.add_argument("--request", metavar="NAME", help="экспортировать конкретный запрос")
+    p_export.add_argument("--folder", metavar="NAME", help="экспортировать конкретную папку")
+    p_export.add_argument("-o", "--output", metavar="FILE", help="файл (по умолчанию — stdout)")
+    p_export.set_defaults(func=cmd_export)
+
+    # import
+    p_import = sub.add_parser("import", help="импортировать из файла обмена")
+    p_import.add_argument("file", help="путь к файлу .getpost.json")
+    p_import.add_argument("--into", metavar="WORKSPACE", help="куда импортировать папку/запрос")
+    p_import.set_defaults(func=cmd_import)
 
     return parser
 

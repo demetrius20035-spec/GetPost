@@ -35,6 +35,10 @@
 
 ### Расширенные возможности
 
+- **Импорт/экспорт** для обмена: любой Workspace, папку или запрос можно
+  выгрузить в самодостаточный файл `*.getpost.json` (правый клик → «Экспортировать…»
+  или «Файл → Экспорт/Импорт», `Ctrl+O`) и импортировать на другой машине — при
+  импорте идентификаторы перегенерируются, существующие данные не затираются.
 - **cURL**: «Copy as cURL» (правый клик по запросу) и импорт запроса из команды
   `curl` (меню «Запрос → Импорт из cURL…»).
 - **Окружения (environments)**: несколько именованных наборов переменных
@@ -125,6 +129,8 @@ Workspace).
 python getpost.py <METHOD> <URL> [опции]     # или: python getpost.py send ...
 python getpost.py run <Workspace> <Запрос>   # запустить сохранённый запрос
 python getpost.py ls [Workspace]             # список Workspace / их содержимого
+python getpost.py export <Workspace> [--request N|--folder N] [-o файл]
+python getpost.py import <файл> [--into <Workspace>]
 ```
 
 Основные возможности:
@@ -157,6 +163,12 @@ python getpost.py POST https://httpbin.org/post --multipart file=@./report.pdf
 # Запуск сохранённого запроса из Workspace (создан в GUI)
 python getpost.py ls
 python getpost.py run "My Workspace" "Get IP"
+
+# Обмен: экспорт и импорт
+python getpost.py export "My Workspace" -o my.getpost.json
+python getpost.py export "My Workspace" --request "Get IP" -o req.getpost.json
+python getpost.py import my.getpost.json                 # новый Workspace
+python getpost.py import req.getpost.json --into "My Workspace"
 ```
 
 Полная справка — `python getpost.py --help` (и `... send --help`).
@@ -173,6 +185,7 @@ getpost_gui/
 ├── variables.py       # подстановка {{var}} (без Qt)
 ├── http_client.py     # сборка и выполнение запроса (тестируемо, без Qt)
 ├── curl.py            # импорт/экспорт в формате curl (тестируемо, без Qt)
+├── share.py           # импорт/экспорт элементов в *.getpost.json (без Qt)
 ├── runner.py          # выполнение запроса в фоновом потоке (QThread)
 ├── highlighter.py     # подсветка синтаксиса JSON/XML
 ├── app.py             # точка входа

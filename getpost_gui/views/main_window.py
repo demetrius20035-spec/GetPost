@@ -6,9 +6,10 @@
 """
 from __future__ import annotations
 
+import re
 from typing import List, Optional
 
-from .. import curl, http_client, models
+from .. import curl, http_client, models, share
 from ..qtcompat import QtCore, QtGui, QtWidgets
 from ..runner import RequestRunner
 from ..storage import Storage, build_default_workspace
@@ -87,6 +88,11 @@ class MainWindow(QtWidgets.QMainWindow):
         save_action = file_menu.addAction("Сохранить сейчас", self._flush_save)
         save_action.setShortcut("Ctrl+S")
         file_menu.addSeparator()
+        import_action = file_menu.addAction("Импорт…", self._import_item)
+        import_action.setShortcut("Ctrl+O")
+        import_action.setStatusTip("Импортировать Workspace, папку или запрос из файла")
+        file_menu.addAction("Экспорт текущего Workspace…", self._export_workspace)
+        file_menu.addSeparator()
         reset_action = file_menu.addAction("Сбросить конфигурацию…", self.reset_config)
         reset_action.setStatusTip("Удалить все рабочие пространства и настройки")
         file_menu.addSeparator()
@@ -121,6 +127,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.structure_changed.connect(self._schedule_save)
         self.sidebar.item_renamed.connect(self._on_item_renamed)
         self.sidebar.copy_curl_requested.connect(self._on_copy_curl)
+        self.sidebar.export_requested.connect(self._export_object)
+        self.sidebar.export_workspace_requested.connect(self._export_workspace)
+        self.sidebar.import_requested.connect(self._import_item)
         self.sidebar.environment_switched.connect(self._on_env_switched)
         self.sidebar.workspace_switched.connect(self.switch_workspace)
         self.sidebar.new_workspace_requested.connect(self.new_workspace)
@@ -259,6 +268,75 @@ class MainWindow(QtWidgets.QMainWindow):
             if req is not None:
                 self.sidebar.add_imported_request(req)
                 self.status.showMessage(f"Импортирован запрос: {req.method} {req.url}", 4000)
+
+    # -- импорт / экспорт ---------------------------------------------------
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        cleaned = re.sub(r"[^\w\-. ]+", "_", name or "").strip()
+        return cleaned or "export"
+
+    _FILE_FILTER = f"GetPost (*{share.FILE_EXTENSION} *.json);;Все файлы (*)"
+
+    def _export_object(self, obj) -> None:
+        if obj is None:
+            return
+        try:
+            kind = share.detect_kind(obj)
+        except TypeError:
+            return
+        default = self._safe_filename(getattr(obj, "name", "export")) + share.FILE_EXTENSION
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Экспорт", default, self._FILE_FILTER)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(share.export_str(obj))
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "Экспорт", f"Не удалось сохранить файл:\n{exc}")
+            return
+        labels = {share.KIND_WORKSPACE: "рабочее пространство", share.KIND_FOLDER: "папка", share.KIND_REQUEST: "запрос"}
+        self.status.showMessage(f"Экспортировано ({labels.get(kind, kind)}): {path}", 5000)
+
+    def _export_workspace(self) -> None:
+        if self.current_ws is not None:
+            self._export_object(self.current_ws)
+
+    def _import_item(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Импорт", "", self._FILE_FILTER)
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            kind, obj = share.parse(text)
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Импорт", f"Не удалось импортировать файл:\n{exc}")
+            return
+
+        if kind == share.KIND_WORKSPACE:
+            self._import_workspace(obj)
+        elif kind == share.KIND_FOLDER:
+            if self.current_ws is None:
+                return
+            relocated = self.sidebar.add_imported_folder(obj)
+            extra = " (помещена в корень из-за лимита вложенности)" if relocated else ""
+            self.status.showMessage(f"Импортирована папка «{obj.name}»{extra}", 5000)
+        else:  # request
+            if self.current_ws is None:
+                return
+            self.sidebar.add_imported_request(obj)
+            self.status.showMessage(f"Импортирован запрос «{obj.name}»", 5000)
+
+    def _import_workspace(self, ws: models.Workspace) -> None:
+        existing = {w.name for w in self.workspaces}
+        if ws.name in existing:
+            ws.name = f"{ws.name} (импорт)"
+        self.storage.save_workspace(ws)
+        self.workspaces.append(ws)
+        self.workspaces.sort(key=lambda w: w.name.lower())
+        self.sidebar.set_workspaces(self.workspaces, ws.id)
+        self._set_current_workspace(ws, select_first=True)
+        self.status.showMessage(f"Импортировано рабочее пространство «{ws.name}»", 5000)
 
     def reset_config(self) -> None:
         reply = QtWidgets.QMessageBox.warning(

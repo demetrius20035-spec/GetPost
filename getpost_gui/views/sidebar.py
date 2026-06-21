@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple, Union
 
-from .. import models
+from .. import models, share
 from ..qtcompat import Qt, QtGui, QtWidgets, Signal
 
 ROLE_OBJ = Qt.ItemDataRole.UserRole
@@ -95,12 +95,15 @@ class Sidebar(QtWidgets.QWidget):
     structure_changed = Signal()             # изменилось дерево → автосохранение
     item_renamed = Signal(object)            # переименован объект (Folder/Request)
     copy_curl_requested = Signal(object)     # «Copy as cURL» для запроса
+    export_requested = Signal(object)        # экспорт папки/запроса в файл
     environment_switched = Signal(str)       # выбрано другое окружение
     workspace_switched = Signal(str)         # выбран другой Workspace (по id)
     new_workspace_requested = Signal()
     rename_workspace_requested = Signal()
     delete_workspace_requested = Signal()
     edit_variables_requested = Signal()
+    export_workspace_requested = Signal()    # экспорт всего Workspace
+    import_requested = Signal()              # импорт из файла
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -129,7 +132,10 @@ class Sidebar(QtWidgets.QWidget):
         ws_menu.addAction("Переименовать", self.rename_workspace_requested.emit)
         ws_menu.addAction("Удалить", self.delete_workspace_requested.emit)
         ws_menu.addSeparator()
-        ws_menu.addAction("Переменные…", self.edit_variables_requested.emit)
+        ws_menu.addAction("Окружения…", self.edit_variables_requested.emit)
+        ws_menu.addSeparator()
+        ws_menu.addAction("Экспортировать Workspace…", self.export_workspace_requested.emit)
+        ws_menu.addAction("Импортировать…", self.import_requested.emit)
         self.ws_menu_btn.setMenu(ws_menu)
 
         ws_row.addWidget(self.ws_combo, 1)
@@ -407,6 +413,7 @@ class Sidebar(QtWidgets.QWidget):
             menu.addAction("Дублировать", lambda: self._duplicate_item(item))
             if isinstance(obj, models.Request):
                 menu.addAction("Copy as cURL", lambda: self.copy_curl_requested.emit(obj))
+            menu.addAction("Экспортировать…", lambda: self.export_requested.emit(obj))
             menu.addAction("Переименовать", lambda: self.tree.editItem(item, 0))
             menu.addAction("Удалить", lambda: self._delete_item(item))
         menu.exec(self.tree.viewport().mapToGlobal(pos))
@@ -452,6 +459,25 @@ class Sidebar(QtWidgets.QWidget):
             parent_item.setExpanded(True)
         self.tree.setCurrentItem(new_item)
         self.structure_changed.emit()
+
+    def add_imported_folder(self, folder: models.Folder) -> bool:
+        """Добавить импортированную папку. Возвращает True, если пришлось
+        положить её в корень из-за ограничения вложенности."""
+        if self._ws is None:
+            return False
+        container, parent_item = self._target_for_new()
+        container_depth = 0 if isinstance(container, models.Workspace) else self._folder_depth(parent_item)
+        relocated = False
+        if container_depth + share.folder_height(folder) > models.MAX_FOLDER_DEPTH:
+            container, parent_item = self._ws, None
+            relocated = isinstance(self._obj_of(self.tree.currentItem()), (models.Folder, models.Request))
+        container.folders.append(folder)
+        new_item = self._add_folder_item(parent_item, folder)
+        if parent_item is not None:
+            parent_item.setExpanded(True)
+        self.tree.setCurrentItem(new_item)
+        self.structure_changed.emit()
+        return relocated
 
     def _on_dropped(self) -> None:
         self._rebuild_model_from_tree()
