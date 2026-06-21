@@ -38,6 +38,31 @@ AUTH_TYPES = [AUTH_NONE, AUTH_BASIC, AUTH_BEARER]
 # Максимальная глубина вложенности папок (Workspace → 1 → 2).
 MAX_FOLDER_DEPTH = 2
 
+# Общепринятые заголовки (имя, значение по умолчанию) — для быстрого добавления.
+COMMON_HEADERS = [
+    ("Accept", "application/json"),
+    ("Content-Type", "application/json"),
+    ("Authorization", ""),
+    ("Accept-Language", "en-US"),
+    ("Accept-Encoding", "gzip, deflate"),
+    ("Cache-Control", "no-cache"),
+    ("User-Agent", "GetPost"),
+    ("X-Requested-With", "XMLHttpRequest"),
+]
+
+# Заголовки, которыми предзаполняется новый запрос (выключены — достаточно
+# поставить галочку, чтобы задействовать; не приходится вводить заново).
+DEFAULT_NEW_HEADERS = [
+    {"enabled": False, "key": "Accept", "value": "application/json"},
+    {"enabled": False, "key": "Content-Type", "value": "application/json"},
+    {"enabled": False, "key": "User-Agent", "value": "GetPost"},
+]
+
+
+def default_new_headers() -> List[Dict[str, Any]]:
+    """Свежая копия списка заголовков по умолчанию для нового запроса."""
+    return [dict(h) for h in DEFAULT_NEW_HEADERS]
+
 
 def new_id() -> str:
     """Сгенерировать уникальный идентификатор."""

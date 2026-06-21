@@ -154,5 +154,21 @@ class TestEnvironments(unittest.TestCase):
         self.assertEqual(ws.variables, {"k": "v"})
 
 
+class TestCommonHeaders(unittest.TestCase):
+    def test_common_headers_non_empty(self):
+        self.assertTrue(models.COMMON_HEADERS)
+        keys = [k for k, _ in models.COMMON_HEADERS]
+        self.assertIn("Content-Type", keys)
+        self.assertIn("Accept", keys)
+
+    def test_default_new_headers_disabled_copy(self):
+        a = models.default_new_headers()
+        b = models.default_new_headers()
+        self.assertIsNot(a, b)  # свежая копия каждый раз
+        self.assertIsNot(a[0], b[0])
+        self.assertTrue(all(not h["enabled"] for h in a))
+        self.assertTrue(len(a) >= 2)
+
+
 if __name__ == "__main__":
     unittest.main()

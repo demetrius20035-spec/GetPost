@@ -138,6 +138,16 @@ class KeyValueTable(QtWidgets.QWidget):
             )
         return items
 
+    def add_item(self, key: str, value: str = "", enabled: bool = True) -> None:
+        """Добавить строку перед завершающей пустой и уведомить об изменении."""
+        self._mutating = True
+        try:
+            row = max(0, self.table.rowCount() - 1)  # перед последней пустой строкой
+            self._insert_row(row, enabled, key, value)
+        finally:
+            self._mutating = False
+        self.changed.emit()
+
     def set_items(self, items: List[Dict[str, Any]]) -> None:
         """Заполнить таблицу из списка словарей."""
         self._mutating = True

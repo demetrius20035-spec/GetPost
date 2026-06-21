@@ -57,6 +57,7 @@ class RequestEditor(QtWidgets.QWidget):
         self.url_edit.setClearButtonEnabled(True)
 
         self.send_btn = QtWidgets.QPushButton("Send")
+        self.send_btn.setObjectName("SendButton")  # для акцентного стиля темы
         self.send_btn.setDefault(True)
         self.send_btn.setMinimumWidth(90)
 
@@ -70,11 +71,32 @@ class RequestEditor(QtWidgets.QWidget):
         self.params_table = KeyValueTable("Параметр", "Значение")
         self.headers_table = KeyValueTable("Заголовок", "Значение")
         self.tabs.addTab(self.params_table, "Params")
-        self.tabs.addTab(self.headers_table, "Headers")
+        self.tabs.addTab(self._build_headers_tab(), "Headers")
         self.tabs.addTab(self._build_body_tab(), "Body")
         self.tabs.addTab(self._build_auth_tab(), "Auth")
         self.tabs.addTab(self._build_options_tab(), "Options")
         layout.addWidget(self.tabs, 1)
+
+    def _build_headers_tab(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(page)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        add_btn = QtWidgets.QToolButton()
+        add_btn.setText("＋ Частый заголовок")
+        add_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QtWidgets.QMenu(add_btn)
+        for name, value in models.COMMON_HEADERS:
+            menu.addAction(name, lambda n=name, val=value: self.headers_table.add_item(n, val))
+        add_btn.setMenu(menu)
+        row.addWidget(add_btn)
+        v.addLayout(row)
+
+        v.addWidget(self.headers_table, 1)
+        return page
 
     def _build_body_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()

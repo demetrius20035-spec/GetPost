@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from .qtcompat import QtWidgets
 from .views.main_window import MainWindow
+from . import theme
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -14,6 +15,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     app.setApplicationName("GetPost")
     app.setOrganizationName("GetPost")
     app.setApplicationDisplayName("GetPost")
+    theme.apply(app)
 
     window = MainWindow()
     window.show()

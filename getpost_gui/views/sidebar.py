@@ -332,6 +332,7 @@ class Sidebar(QtWidgets.QWidget):
             return
         container, parent_item = self._target_for_new()
         req = models.Request(name="Новый запрос")
+        req.headers = models.default_new_headers()
         container.requests.append(req)
         new_item = self._add_request_item(parent_item, req)
         if parent_item is not None:
@@ -411,6 +412,8 @@ class Sidebar(QtWidgets.QWidget):
         if obj is not None:
             menu.addSeparator()
             menu.addAction("Дублировать", lambda: self._duplicate_item(item))
+            menu.addAction("Переместить в…", lambda: self._move_to(item))
+            menu.addAction("Копировать в…", lambda: self._copy_to(item))
             if isinstance(obj, models.Request):
                 menu.addAction("Copy as cURL", lambda: self.copy_curl_requested.emit(obj))
             menu.addAction("Экспортировать…", lambda: self.export_requested.emit(obj))
@@ -447,6 +450,94 @@ class Sidebar(QtWidgets.QWidget):
         item = self.tree.currentItem()
         if item is not None:
             self._duplicate_item(item)
+
+    # -- перемещение / копирование между папками ---------------------------
+    def _iter_folder_paths(self, container: Container, prefix: str = "", depth: int = 1):
+        for f in container.folders:
+            path = prefix + f.name
+            yield path, f, depth
+            yield from self._iter_folder_paths(f, path + "/", depth + 1)
+
+    @staticmethod
+    def _subtree_folders(folder: models.Folder) -> set:
+        result = {folder}
+        for sub in folder.folders:
+            result |= Sidebar._subtree_folders(sub)
+        return result
+
+    def _choose_container(self, title: str, exclude: Optional[set] = None):
+        """Диалог выбора папки назначения. Возвращает (container, depth) или None."""
+        exclude = exclude or set()
+        options = ["(корень)"]
+        mapping = {"(корень)": (self._ws, 0)}
+        for path, folder, depth in self._iter_folder_paths(self._ws):
+            if folder in exclude:
+                continue
+            options.append(path)
+            mapping[path] = (folder, depth)
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self, title, "Папка назначения:", options, 0, False
+        )
+        if not ok:
+            return None
+        return mapping.get(choice)
+
+    def _move_to(self, item) -> None:
+        obj = self._obj_of(item)
+        if obj is None or self._ws is None:
+            return
+        exclude = self._subtree_folders(obj) if isinstance(obj, models.Folder) else None
+        chosen = self._choose_container("Переместить в…", exclude)
+        if chosen is None:
+            return
+        target, depth = chosen
+        if isinstance(obj, models.Folder) and depth + share.folder_height(obj) > models.MAX_FOLDER_DEPTH:
+            QtWidgets.QMessageBox.information(
+                self, "Перемещение", f"Не помещается: превышен лимит вложенности ({models.MAX_FOLDER_DEPTH})."
+            )
+            return
+        source = self._container_of_item(item)
+        if source is target:
+            return
+        if isinstance(obj, models.Folder):
+            source.folders.remove(obj)
+            target.folders.append(obj)
+        else:
+            source.requests.remove(obj)
+            target.requests.append(obj)
+        self._rebuild_tree()
+        self._select_obj(obj)
+        self.structure_changed.emit()
+
+    def _copy_to(self, item) -> None:
+        obj = self._obj_of(item)
+        if obj is None or self._ws is None:
+            return
+        chosen = self._choose_container("Копировать в…")
+        if chosen is None:
+            return
+        target, depth = chosen
+        if isinstance(obj, models.Folder) and depth + share.folder_height(obj) > models.MAX_FOLDER_DEPTH:
+            QtWidgets.QMessageBox.information(
+                self, "Копирование", f"Не помещается: превышен лимит вложенности ({models.MAX_FOLDER_DEPTH})."
+            )
+            return
+        clone = obj.clone(new_name=obj.name)  # копия с тем же именем, но новыми id
+        if isinstance(obj, models.Folder):
+            target.folders.append(clone)
+        else:
+            target.requests.append(clone)
+        self._rebuild_tree()
+        self._select_obj(clone)
+        self.structure_changed.emit()
+
+    def _select_obj(self, obj) -> None:
+        it = QtWidgets.QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            if self._obj_of(it.value()) is obj:
+                self.tree.setCurrentItem(it.value())
+                return
+            it += 1
 
     def add_imported_request(self, req: models.Request) -> None:
         """Добавить готовый запрос (например, импортированный из cURL)."""
