@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-from .. import curl, models
-from ..qtcompat import QtWidgets
-from .widgets import KeyValueTable
+from .. import codegen, curl, models, share
+from ..qtcompat import QtCore, QtWidgets
+from .widgets import KeyValueTable, monospace_font
 
 
 def _table_to_dict(table: KeyValueTable) -> Dict[str, str]:
@@ -29,6 +29,7 @@ class EnvironmentsDialog(QtWidgets.QDialog):
         self._envs: Dict[str, Dict[str, str]] = {n: dict(v) for n, v in ws.environments.items()}
         self._active: str = ws.active_env
         self._current: Optional[str] = None
+        self._secrets: set = set(ws.secret_vars)
 
         main = QtWidgets.QHBoxLayout(self)
 
@@ -57,12 +58,22 @@ class EnvironmentsDialog(QtWidgets.QDialog):
         right = QtWidgets.QVBoxLayout()
         info = QtWidgets.QLabel(
             "Переменные используются как <code>{{имя}}</code> в URL, заголовках, "
-            "параметрах и теле. Активное окружение помечено значком ★."
+            "параметрах и теле. Активное окружение помечено значком ★. Секретные "
+            "значения не попадают в экспорт."
         )
         info.setWordWrap(True)
         right.addWidget(info)
-        self.table = KeyValueTable("Переменная", "Значение")
+
+        self.table = KeyValueTable("Переменная", "Значение", secret_column=True)
         right.addWidget(self.table, 1)
+
+        mask_row = QtWidgets.QHBoxLayout()
+        self.mask_check = QtWidgets.QCheckBox("Скрывать секретные значения")
+        self.mask_check.setChecked(True)
+        self.mask_check.toggled.connect(self._apply_mask)
+        mask_row.addWidget(self.mask_check)
+        mask_row.addStretch(1)
+        right.addLayout(mask_row)
         main.addLayout(right, 2)
 
         # Кнопки OK/Cancel — справа снизу.
@@ -97,12 +108,34 @@ class EnvironmentsDialog(QtWidgets.QDialog):
         name = self._name_at(row)
         self._current = name
         if name is not None:
-            items = [{"enabled": True, "key": k, "value": v} for k, v in self._envs[name].items()]
+            items = [
+                {
+                    "enabled": True,
+                    "key": k,
+                    "value": v,
+                    # Помечаем как секрет вручную отмеченные и «похожие» имена.
+                    "secret": k in self._secrets or share.looks_secret(k),
+                }
+                for k, v in self._envs[name].items()
+            ]
             self.table.set_items(items)
+            self._apply_mask(self.mask_check.isChecked())
+
+    def _apply_mask(self, mask: bool) -> None:
+        self.table.set_secret_masked(mask)
 
     def _save_current(self) -> None:
         if self._current is not None and self._current in self._envs:
             self._envs[self._current] = _table_to_dict(self.table)
+            # Обновляем набор секретных имён по галочкам таблицы.
+            for it in self.table.get_items():
+                key = str(it.get("key", "")).strip()
+                if not key:
+                    continue
+                if it.get("secret"):
+                    self._secrets.add(key)
+                else:
+                    self._secrets.discard(key)
 
     # -- действия -----------------------------------------------------------
     def _add(self) -> None:
@@ -155,6 +188,9 @@ class EnvironmentsDialog(QtWidgets.QDialog):
     def active(self) -> str:
         return self._active
 
+    def secret_vars(self) -> list:
+        return sorted(self._secrets)
+
 
 class ImportCurlDialog(QtWidgets.QDialog):
     """Импорт запроса из команды ``curl``."""
@@ -199,28 +235,152 @@ class ImportCurlDialog(QtWidgets.QDialog):
         return self._request
 
 
-class CurlExportDialog(QtWidgets.QDialog):
-    """Показ сгенерированной команды ``curl`` с кнопкой копирования."""
+class CodeExportDialog(QtWidgets.QDialog):
+    """Генерация кода запроса на разных языках с копированием в буфер."""
 
-    def __init__(self, command: str, parent=None):
+    def __init__(self, req: models.Request, variables: Dict[str, str],
+                 language: str = codegen.LANG_CURL, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Copy as cURL")
-        self.resize(620, 240)
+        self.setWindowTitle("Сгенерировать код")
+        self.resize(680, 420)
+        self._req = req
+        self._variables = variables or {}
+
         layout = QtWidgets.QVBoxLayout(self)
-        self.edit = QtWidgets.QPlainTextEdit()
-        self.edit.setPlainText(command)
-        self.edit.setReadOnly(True)
-        layout.addWidget(self.edit, 1)
 
         row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Язык:"))
+        self.lang_combo = QtWidgets.QComboBox()
+        for key, title in codegen.LANGUAGES:
+            self.lang_combo.addItem(title, key)
+        idx = self.lang_combo.findData(language)
+        if idx >= 0:
+            self.lang_combo.setCurrentIndex(idx)
+        self.lang_combo.currentIndexChanged.connect(self._render)
+        row.addWidget(self.lang_combo)
         row.addStretch(1)
+        self.secret_note = QtWidgets.QLabel("Код может содержать токены — не публикуйте как есть.")
+        self.secret_note.setStyleSheet("color: #b26a00;")
+        row.addWidget(self.secret_note)
+        layout.addLayout(row)
+
+        self.edit = QtWidgets.QPlainTextEdit()
+        self.edit.setReadOnly(True)
+        self.edit.setFont(monospace_font())
+        self.edit.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(self.edit, 1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
         copy_btn = QtWidgets.QPushButton("Копировать")
         copy_btn.clicked.connect(self._copy)
+        save_btn = QtWidgets.QPushButton("Сохранить…")
+        save_btn.clicked.connect(self._save)
         close_btn = QtWidgets.QPushButton("Закрыть")
         close_btn.clicked.connect(self.accept)
-        row.addWidget(copy_btn)
-        row.addWidget(close_btn)
-        layout.addLayout(row)
+        buttons.addWidget(copy_btn)
+        buttons.addWidget(save_btn)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self._render()
+
+    def _render(self) -> None:
+        language = self.lang_combo.currentData()
+        try:
+            code = codegen.generate(language, self._req, self._variables)
+        except Exception as exc:  # noqa: BLE001 - показываем пользователю
+            code = f"# Не удалось сгенерировать код: {exc}"
+        self.edit.setPlainText(code)
 
     def _copy(self) -> None:
         QtWidgets.QApplication.clipboard().setText(self.edit.toPlainText())
+
+    def _save(self) -> None:
+        extensions = {
+            codegen.LANG_PYTHON: "request.py",
+            codegen.LANG_JS: "request.js",
+            codegen.LANG_HTTPIE: "request.sh",
+            codegen.LANG_CURL: "request.sh",
+        }
+        default = extensions.get(self.lang_combo.currentData(), "request.txt")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить код", default)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.edit.toPlainText())
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "Сохранение", f"Не удалось сохранить файл:\n{exc}")
+
+
+class QuickOpenDialog(QtWidgets.QDialog):
+    """Быстрый переход к запросу: поиск по имени, пути и URL (Ctrl+P)."""
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Быстрый переход")
+        self.resize(560, 420)
+        self._items = list(items)  # [(path, request), ...]
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Начните вводить имя, путь или URL…")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._refilter)
+        layout.addWidget(self.search)
+
+        self.list = QtWidgets.QListWidget()
+        self.list.itemActivated.connect(lambda _: self.accept())
+        self.list.itemDoubleClicked.connect(lambda _: self.accept())
+        layout.addWidget(self.list, 1)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Open
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # Стрелки из поля поиска управляют списком.
+        self.search.installEventFilter(self)
+        self._refilter("")
+
+    def eventFilter(self, obj, event):  # noqa: N802 - имя задано Qt
+        if obj is self.search and event.type() == QtCore.QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (QtCore.Qt.Key.Key_Down, QtCore.Qt.Key.Key_Up):
+                row = self.list.currentRow()
+                self.list.setCurrentRow(max(0, row + (1 if key == QtCore.Qt.Key.Key_Down else -1)))
+                return True
+        return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _matches(query: str, text: str) -> bool:
+        """Нестрогое совпадение: символы запроса идут в тексте по порядку."""
+        text = text.lower()
+        position = 0
+        for char in query.lower():
+            position = text.find(char, position)
+            if position < 0:
+                return False
+            position += 1
+        return True
+
+    def _refilter(self, query: str) -> None:
+        query = (query or "").strip()
+        self.list.clear()
+        for path, req in self._items:
+            haystack = f"{path} {req.method} {req.url}"
+            if query and not self._matches(query, haystack):
+                continue
+            item = QtWidgets.QListWidgetItem(f"{req.method:6} {path}    {req.url}")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, req)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+    def selected_request(self):
+        item = self.list.currentItem()
+        return item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None

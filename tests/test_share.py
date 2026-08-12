@@ -78,6 +78,70 @@ class TestParse(unittest.TestCase):
             share.parse(bad)
 
 
+class TestSecrets(unittest.TestCase):
+    def _workspace(self):
+        ws = models.Workspace("W")
+        req = models.Request("Login")
+        req.auth_type = models.AUTH_BASIC
+        req.auth_basic_username = "admin"
+        req.auth_basic_password = "PW"
+        req.auth_bearer_token = "TOKEN"
+        folder = models.Folder("Auth")
+        folder.requests.append(req)
+        ws.folders.append(folder)
+        ws.variables = {"api_key": "KEY", "base_url": "https://api.io", "my_token": "T"}
+        ws.set_secret("api_key", True)
+        return ws
+
+    def test_export_strips_auth_secrets(self):
+        text = share.export_str(self._workspace())
+        self.assertNotIn("PW", text)
+        self.assertNotIn("TOKEN", text)
+        self.assertIn("admin", text)  # логин — не секрет
+
+    def test_export_strips_marked_and_heuristic_variables(self):
+        text = share.export_str(self._workspace())
+        self.assertNotIn('"KEY"', text)   # помечен вручную
+        self.assertNotIn('"T"', text)     # распознан по имени (my_token)
+        self.assertIn("https://api.io", text)
+
+    def test_export_reports_what_was_stripped(self):
+        env = share.export_dict(self._workspace())
+        self.assertFalse(env["contains_secrets"])
+        self.assertTrue(env["stripped"])
+
+    def test_include_secrets_keeps_everything(self):
+        text = share.export_str(self._workspace(), include_secrets=True)
+        self.assertIn("PW", text)
+        self.assertIn("KEY", text)
+        self.assertTrue(json.loads(text)["contains_secrets"])
+
+    def test_export_does_not_mutate_source(self):
+        ws = self._workspace()
+        share.export_str(ws)
+        self.assertEqual(ws.variables["api_key"], "KEY")
+        self.assertEqual(ws.folders[0].requests[0].auth_basic_password, "PW")
+
+    def test_structure_survives_stripping(self):
+        kind, obj = share.parse(share.export_str(self._workspace()))
+        self.assertEqual(kind, share.KIND_WORKSPACE)
+        self.assertEqual(obj.folders[0].requests[0].auth_basic_username, "admin")
+        self.assertEqual(obj.folders[0].requests[0].auth_basic_password, "")
+        self.assertIn("api_key", obj.variables)  # имя осталось, значение пустое
+        self.assertEqual(obj.variables["api_key"], "")
+
+    def test_looks_secret_heuristic(self):
+        for name in ("token", "API_KEY", "my-password", "clientSecret", "session_id"):
+            self.assertTrue(share.looks_secret(name), name)
+        for name in ("base_url", "page", "user_name", "timeout"):
+            self.assertFalse(share.looks_secret(name), name)
+
+    def test_no_secrets_no_stripped_key(self):
+        ws = models.Workspace("Clean")
+        ws.variables = {"base_url": "http://x"}
+        self.assertNotIn("stripped", share.export_dict(ws))
+
+
 class TestFolderHeight(unittest.TestCase):
     def test_height(self):
         self.assertEqual(share.folder_height(models.Folder()), 1)

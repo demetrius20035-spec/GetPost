@@ -7,8 +7,10 @@
 """
 from __future__ import annotations
 
+import mimetypes
+import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -17,6 +19,20 @@ from .variables import substitute
 
 # Тайм-аут запроса по умолчанию (секунды).
 DEFAULT_TIMEOUT = 30
+
+# Максимальный размер тела ответа, который читаем в память (16 МБ).
+# Всё, что больше, обрезается — интерфейс не должен падать от гигантского файла.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+# Размер блока при потоковом чтении (позволяет прерывать загрузку).
+_CHUNK = 64 * 1024
+
+# Префикс значения поля form-data, означающий «это файл»: ``key=@/path/to/file``.
+FILE_PREFIX = "@"
+
+
+class Cancelled(Exception):
+    """Запрос был отменён пользователем."""
 
 
 class ResponseData:
@@ -47,11 +63,18 @@ class ResponseData:
         self.ok = ok
         self.content = content
         self.cookies = cookies or []
+        # Тело было обрезано по лимиту MAX_RESPONSE_BYTES.
+        self.truncated = False
 
     @property
     def status_line(self) -> str:
         reason = f" {self.reason}" if self.reason else ""
         return f"{self.status_code}{reason}"
+
+    def drop_body(self) -> None:
+        """Освободить память под телом, оставив метаданные (для истории)."""
+        self.content = b""
+        self.text = ""
 
 
 def _enabled_pairs(items: List[Dict[str, Any]], variables: Dict[str, str]) -> List[Tuple[str, str]]:
@@ -74,6 +97,30 @@ def _enabled_pairs(items: List[Dict[str, Any]], variables: Dict[str, str]) -> Li
 def _has_header(headers: List[Tuple[str, str]], name: str) -> bool:
     name = name.lower()
     return any(k.lower() == name for k, _ in headers)
+
+
+def is_file_value(value: str) -> bool:
+    """Значение поля означает файл (``@/path/to/file``)?"""
+    return isinstance(value, str) and value.startswith(FILE_PREFIX) and len(value) > 1
+
+
+def build_multipart(pairs: List[Tuple[str, str]]) -> List[Tuple[str, Tuple]]:
+    """Собрать ``files`` для multipart/form-data.
+
+    Значение ``@путь`` читается как файл (с определением MIME-типа), остальные
+    поля отправляются как обычные текстовые части. Используется и GUI, и CLI.
+    """
+    files: List[Tuple[str, Tuple]] = []
+    for key, value in pairs:
+        if is_file_value(value):
+            path = value[len(FILE_PREFIX):]
+            ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            with open(path, "rb") as fh:
+                content = fh.read()
+            files.append((key, (os.path.basename(path), content, ctype)))
+        else:
+            files.append((key, (None, value)))
+    return files
 
 
 def build_request_kwargs(
@@ -121,10 +168,11 @@ def build_request_kwargs(
         # requests сам выставит Content-Type: application/x-www-form-urlencoded
         kwargs["data"] = _enabled_pairs(req.body_form, variables)
     elif req.body_type == models.BODY_FORM_DATA:
-        # multipart/form-data: текстовые поля передаются как (None, value)
+        # multipart/form-data: текстовые поля — (None, value); значение вида
+        # "@/path/to/file" отправляется как файл.
         pairs = _enabled_pairs(req.body_form, variables)
         if pairs:
-            kwargs["files"] = [(k, (None, v)) for k, v in pairs]
+            kwargs["files"] = build_multipart(pairs)
 
     # requests ожидает dict для заголовков (CaseInsensitiveDict).
     if headers:
@@ -141,31 +189,74 @@ def perform_prepared(
     kwargs: Dict[str, Any],
     timeout: float = DEFAULT_TIMEOUT,
     session: Optional[requests.Session] = None,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> ResponseData:
-    """Выполнить уже подготовленный запрос и вернуть ``ResponseData``."""
+    """Выполнить уже подготовленный запрос и вернуть ``ResponseData``.
+
+    Тело читается потоком блоками: это позволяет прервать скачивание
+    (``should_cancel``) и не читать в память больше ``max_bytes``.
+    """
     if not url:
         raise ValueError("URL пуст")
 
     caller = session if session is not None else requests
     start = time.perf_counter()
-    resp = caller.request(method, url, timeout=timeout, **kwargs)
-    content = resp.content  # принудительно читаем тело в этом потоке
-    text = resp.text
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    resp = caller.request(method, url, timeout=timeout, stream=True, **kwargs)
+    try:
+        chunks: List[bytes] = []
+        total = 0
+        truncated = False
+        for chunk in resp.iter_content(chunk_size=_CHUNK):
+            if should_cancel is not None and should_cancel():
+                raise Cancelled()
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                # Забираем «хвост» до лимита и прекращаем чтение.
+                allowed = max_bytes - (total - len(chunk))
+                if allowed > 0:
+                    chunks.append(chunk[:allowed])
+                truncated = True
+                break
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
 
-    return ResponseData(
-        status_code=resp.status_code,
-        reason=resp.reason or "",
-        headers=list(resp.headers.items()),
-        text=text,
-        elapsed_ms=elapsed_ms,
-        size_bytes=len(content),
-        url=resp.url,
-        content_type=resp.headers.get("Content-Type", ""),
-        ok=resp.ok,
-        content=content,
-        cookies=list(resp.cookies.items()),
-    )
+        # Кодировку берём только из заголовков: тело уже вычитано потоком,
+        # поэтому resp.apparent_encoding обращаться к нему не может.
+        encoding = resp.encoding
+        if encoding:
+            try:
+                text = content.decode(encoding, "replace")
+            except LookupError:  # неизвестное имя кодировки
+                text = content.decode("utf-8", "replace")
+        else:
+            # Без charset в Content-Type: JSON и большинство API — UTF-8,
+            # а latin-1 как запасной вариант декодирует любые байты.
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                text = content.decode("latin-1", "replace")
+
+        data = ResponseData(
+            status_code=resp.status_code,
+            reason=resp.reason or "",
+            headers=list(resp.headers.items()),
+            text=text,
+            elapsed_ms=elapsed_ms,
+            size_bytes=total,
+            url=resp.url,
+            content_type=resp.headers.get("Content-Type", ""),
+            ok=resp.ok,
+            content=content,
+            cookies=list(resp.cookies.items()),
+        )
+        data.truncated = truncated
+        return data
+    finally:
+        resp.close()
 
 
 def perform_request(

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 from typing import List, Optional, Tuple, Union
 
 from .. import models, share
@@ -108,8 +109,20 @@ class Sidebar(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._ws: Optional[models.Workspace] = None
+        self._controller = None
         self._building = False
         self._build_ui()
+
+    # -- контроллер (отменяемые изменения) ---------------------------------
+    def set_controller(self, controller) -> None:
+        """Подключить контроллер: изменения станут отменяемыми (Ctrl+Z)."""
+        self._controller = controller
+
+    def _txn(self, description: str):
+        """Контекст отменяемого изменения модели."""
+        if self._controller is None:
+            return contextlib.nullcontext()
+        return self._controller.transaction(description)
 
     # -- построение интерфейса ---------------------------------------------
     def _build_ui(self) -> None:
@@ -319,7 +332,8 @@ class Sidebar(QtWidgets.QWidget):
             )
             return
         folder = models.Folder(name="Новая папка")
-        container.folders.append(folder)
+        with self._txn("Создание папки"):
+            container.folders.append(folder)
         new_item = self._add_folder_item(parent_item, folder)
         if parent_item is not None:
             parent_item.setExpanded(True)
@@ -333,7 +347,8 @@ class Sidebar(QtWidgets.QWidget):
         container, parent_item = self._target_for_new()
         req = models.Request(name="Новый запрос")
         req.headers = models.default_new_headers()
-        container.requests.append(req)
+        with self._txn("Создание запроса"):
+            container.requests.append(req)
         new_item = self._add_request_item(parent_item, req)
         if parent_item is not None:
             parent_item.setExpanded(True)
@@ -360,7 +375,8 @@ class Sidebar(QtWidgets.QWidget):
         new_name = text.strip()
         if not new_name:
             new_name = obj.name  # пустое имя не допускаем
-        obj.name = new_name
+        with self._txn("Переименование"):
+            obj.name = new_name
         # Возвращаем иконку в подпись (без повторного срабатывания сигнала).
         self._building = True
         try:
@@ -389,10 +405,11 @@ class Sidebar(QtWidgets.QWidget):
             return
 
         container = self._container_of_item(item)
-        if isinstance(obj, models.Folder):
-            container.folders.remove(obj)
-        else:
-            container.requests.remove(obj)
+        with self._txn(f"Удаление: {obj.name}"):
+            if isinstance(obj, models.Folder):
+                container.folders.remove(obj)
+            else:
+                container.requests.remove(obj)
         (item.parent() or self.tree.invisibleRootItem()).removeChild(item)
 
         if isinstance(obj, models.Request):
@@ -428,13 +445,15 @@ class Sidebar(QtWidgets.QWidget):
             return
         container = self._container_of_item(item)
         parent_item = item.parent()
+        clone = obj.clone()
+        with self._txn(f"Дублирование: {obj.name}"):
+            if isinstance(obj, models.Folder):
+                container.folders.append(clone)
+            else:
+                container.requests.append(clone)
         if isinstance(obj, models.Folder):
-            clone = obj.clone()
-            container.folders.append(clone)
             new_item = self._add_folder_item(parent_item, clone)
         else:
-            clone = obj.clone()
-            container.requests.append(clone)
             new_item = self._add_request_item(parent_item, clone)
         if parent_item is not None:
             parent_item.setExpanded(True)
@@ -499,12 +518,13 @@ class Sidebar(QtWidgets.QWidget):
         source = self._container_of_item(item)
         if source is target:
             return
-        if isinstance(obj, models.Folder):
-            source.folders.remove(obj)
-            target.folders.append(obj)
-        else:
-            source.requests.remove(obj)
-            target.requests.append(obj)
+        with self._txn(f"Перемещение: {obj.name}"):
+            if isinstance(obj, models.Folder):
+                source.folders.remove(obj)
+                target.folders.append(obj)
+            else:
+                source.requests.remove(obj)
+                target.requests.append(obj)
         self._rebuild_tree()
         self._select_obj(obj)
         self.structure_changed.emit()
@@ -523,13 +543,18 @@ class Sidebar(QtWidgets.QWidget):
             )
             return
         clone = obj.clone(new_name=obj.name)  # копия с тем же именем, но новыми id
-        if isinstance(obj, models.Folder):
-            target.folders.append(clone)
-        else:
-            target.requests.append(clone)
+        with self._txn(f"Копирование: {obj.name}"):
+            if isinstance(obj, models.Folder):
+                target.folders.append(clone)
+            else:
+                target.requests.append(clone)
         self._rebuild_tree()
         self._select_obj(clone)
         self.structure_changed.emit()
+
+    def select_request(self, req) -> None:
+        """Выбрать в дереве указанный запрос (быстрый переход, отмена)."""
+        self._select_obj(req)
 
     def _select_obj(self, obj) -> None:
         it = QtWidgets.QTreeWidgetItemIterator(self.tree)
@@ -544,7 +569,8 @@ class Sidebar(QtWidgets.QWidget):
         if self._ws is None:
             return
         container, parent_item = self._target_for_new()
-        container.requests.append(req)
+        with self._txn(f"Импорт запроса: {req.name}"):
+            container.requests.append(req)
         new_item = self._add_request_item(parent_item, req)
         if parent_item is not None:
             parent_item.setExpanded(True)
@@ -562,7 +588,8 @@ class Sidebar(QtWidgets.QWidget):
         if container_depth + share.folder_height(folder) > models.MAX_FOLDER_DEPTH:
             container, parent_item = self._ws, None
             relocated = isinstance(self._obj_of(self.tree.currentItem()), (models.Folder, models.Request))
-        container.folders.append(folder)
+        with self._txn(f"Импорт папки: {folder.name}"):
+            container.folders.append(folder)
         new_item = self._add_folder_item(parent_item, folder)
         if parent_item is not None:
             parent_item.setExpanded(True)
@@ -571,7 +598,10 @@ class Sidebar(QtWidgets.QWidget):
         return relocated
 
     def _on_dropped(self) -> None:
-        self._rebuild_model_from_tree()
+        # Снимок «до» берётся из модели, которая ещё не знает о перемещении —
+        # поэтому drag & drop тоже отменяется по Ctrl+Z.
+        with self._txn("Перетаскивание"):
+            self._rebuild_model_from_tree()
         self.tree.expandAll()
         self.structure_changed.emit()
 

@@ -45,18 +45,100 @@ def detect_kind(obj) -> str:
     raise TypeError(f"Нельзя экспортировать объект типа {type(obj).__name__}")
 
 
-def export_dict(obj) -> dict:
-    """Сформировать «конверт» для экспорта объекта."""
-    return {
+# Поля запроса, содержащие секреты (вычищаются при экспорте по умолчанию).
+SECRET_REQUEST_FIELDS = ("auth_basic_password", "auth_bearer_token")
+
+# Эвристика: переменные с такими подстроками в имени считаются секретными,
+# даже если пользователь не пометил их вручную.
+_SECRET_NAME_HINTS = (
+    "token", "secret", "password", "passwd", "pwd", "apikey", "api_key",
+    "auth", "credential", "bearer", "private", "session",
+)
+
+
+def looks_secret(name: str) -> bool:
+    """Похоже ли имя переменной на секрет (по общепринятым признакам)."""
+    lowered = (name or "").lower().replace("-", "_")
+    return any(hint in lowered for hint in _SECRET_NAME_HINTS)
+
+
+def _strip_requests(node: dict) -> None:
+    """Рекурсивно вычистить секреты из запросов в сериализованном узле."""
+    for req in node.get("requests", []) or []:
+        if isinstance(req, dict):
+            for field in SECRET_REQUEST_FIELDS:
+                if req.get(field):
+                    req[field] = ""
+    for folder in node.get("folders", []) or []:
+        if isinstance(folder, dict):
+            _strip_requests(folder)
+
+
+def strip_secrets(data: dict, secret_vars=None) -> list:
+    """Убрать секреты из сериализованных данных. Возвращает список того,
+    что было вычищено (для показа пользователю)."""
+    removed = []
+    secret_vars = set(secret_vars or [])
+
+    def count_requests(node: dict) -> int:
+        total = sum(
+            1
+            for r in node.get("requests", []) or []
+            if isinstance(r, dict) and any(r.get(f) for f in SECRET_REQUEST_FIELDS)
+        )
+        for f in node.get("folders", []) or []:
+            if isinstance(f, dict):
+                total += count_requests(f)
+        return total
+
+    n_auth = count_requests(data)
+    if n_auth:
+        removed.append(f"пароли/токены авторизации: {n_auth}")
+    _strip_requests(data)
+
+    # Значения секретных переменных окружений (имя остаётся — структура нужна).
+    envs = data.get("environments")
+    if isinstance(envs, dict):
+        cleared = set()
+        for env_vars in envs.values():
+            if not isinstance(env_vars, dict):
+                continue
+            for name in list(env_vars):
+                if name in secret_vars or looks_secret(name):
+                    if env_vars[name]:
+                        cleared.add(name)
+                    env_vars[name] = ""
+        if cleared:
+            removed.append("переменные: " + ", ".join(sorted(cleared)))
+    return removed
+
+
+def export_dict(obj, include_secrets: bool = False) -> dict:
+    """Сформировать «конверт» для экспорта объекта.
+
+    По умолчанию секреты (пароли, токены, значения секретных переменных)
+    вычищаются: экспортированный файл предназначен для обмена с другими людьми.
+    """
+    data = obj.to_dict()
+    removed = []
+    if not include_secrets:
+        secret_vars = getattr(obj, "secret_vars", None)
+        removed = strip_secrets(data, secret_vars)
+
+    envelope = {
         FORMAT_KEY: FORMAT_VERSION,
         "type": detect_kind(obj),
         "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "data": obj.to_dict(),
+        "contains_secrets": bool(include_secrets),
+        "data": data,
     }
+    if removed:
+        envelope["stripped"] = removed
+    return envelope
 
 
-def export_str(obj) -> str:
-    return json.dumps(export_dict(obj), ensure_ascii=False, indent=2)
+def export_str(obj, include_secrets: bool = False) -> str:
+    return json.dumps(export_dict(obj, include_secrets), ensure_ascii=False, indent=2)
 
 
 def _reassign_request(req: models.Request) -> None:

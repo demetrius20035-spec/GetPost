@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -95,11 +96,30 @@ class Storage:
             return None
 
     def save_workspace(self, ws: Workspace) -> Path:
+        """Сохранить Workspace. Перед перезаписью делается копия ``*.bak``.
+
+        Может выбросить ``OSError`` (нет места, нет прав) — вызывающая сторона
+        обязана сообщить об этом пользователю, а не проглатывать ошибку.
+        """
         path = self._workspace_path(ws)
         text = json.dumps(ws.to_dict(), ensure_ascii=False, indent=2)
+        self._backup(path)
         self._atomic_write(path, text)
         ws.file_path = str(path)
         return path
+
+    @staticmethod
+    def _backup(path: Path) -> None:
+        """Сохранить предыдущую версию файла рядом (``*.json.bak``).
+
+        Ошибка резервного копирования не должна мешать основной записи.
+        """
+        if not path.exists():
+            return
+        try:
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        except OSError:
+            pass
 
     def delete_workspace(self, ws: Workspace) -> None:
         path = self._workspace_path(ws)
@@ -127,7 +147,7 @@ class Storage:
     # -- сброс --------------------------------------------------------------
     def reset(self) -> None:
         """Удалить все Workspaces и настройки (сброс к значениям по умолчанию)."""
-        for path in self.list_workspace_files():
+        for path in list(self.list_workspace_files()) + list(self.workspaces_dir.glob("*.bak")):
             try:
                 path.unlink()
             except OSError:

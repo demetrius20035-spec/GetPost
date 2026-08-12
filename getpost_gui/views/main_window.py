@@ -9,16 +9,23 @@ from __future__ import annotations
 import re
 from typing import List, Optional
 
-from .. import curl, http_client, models, share
+import requests
+
+from .. import capture, codegen, http_client, models, share
+from ..controller import WorkspaceController
 from ..qtcompat import QtCore, QtGui, QtWidgets
 from ..runner import RequestRunner
 from ..storage import Storage, build_default_workspace
-from .dialogs import CurlExportDialog, EnvironmentsDialog, ImportCurlDialog
+from .dialogs import CodeExportDialog, EnvironmentsDialog, ImportCurlDialog, QuickOpenDialog
 from .request_editor import RequestEditor
 from .response_view import ResponseView
 from .sidebar import Sidebar
 
 _URL_HISTORY_LIMIT = 50
+
+# Сколько ответов держать в истории на один запрос и сколько из них — с телом.
+_HISTORY_PER_REQUEST = 10
+_HISTORY_WITH_BODY = 3
 
 # Задержка автосохранения (мс) — изменения объединяются в одну запись.
 _AUTOSAVE_DELAY_MS = 500
@@ -34,9 +41,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workspaces: List[models.Workspace] = []
         self.current_ws: Optional[models.Workspace] = None
         self._runner: Optional[RequestRunner] = None
-        # История ответов по id запроса (только в памяти).
+        # История ответов по id запроса (только в памяти, с ограничениями).
         self._history: dict = {}
         self._sending_req: Optional[models.Request] = None
+        self._save_error_shown = False
+        # Контроллер: единая точка изменений модели + история отмен.
+        self.controller = WorkspaceController(self)
+        # Одна сессия на приложение: keep-alive соединений и общие cookies.
+        self.session = requests.Session()
 
         self.setWindowTitle("GetPost — HTTP-клиент")
         self.resize(1200, 720)
@@ -56,7 +68,9 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- интерфейс ----------------------------------------------------------
     def _build_ui(self) -> None:
         self.sidebar = Sidebar()
+        self.sidebar.set_controller(self.controller)
         self.editor = RequestEditor()
+        self.editor.set_controller(self.controller)
         self.response = ResponseView()
 
         # Автодополнение URL по истории отправленных адресов.
@@ -99,6 +113,14 @@ class MainWindow(QtWidgets.QMainWindow):
         quit_action = file_menu.addAction("Выход", self.close)
         quit_action.setShortcut(QtGui.QKeySequence.StandardKey.Quit)
 
+        edit_menu = menubar.addMenu("Правка")
+        edit_menu.addAction(self.controller.create_undo_action(self))
+        edit_menu.addAction(self.controller.create_redo_action(self))
+        edit_menu.addSeparator()
+        quick_action = edit_menu.addAction("Быстрый переход к запросу…", self.quick_open)
+        quick_action.setShortcut("Ctrl+P")
+        quick_action.setStatusTip("Найти запрос по имени или URL")
+
         ws_menu = menubar.addMenu("Рабочее пространство")
         ws_menu.addAction("Создать", self.new_workspace)
         ws_menu.addAction("Переименовать", self.rename_workspace)
@@ -117,6 +139,9 @@ class MainWindow(QtWidgets.QMainWindow):
         dup_action.setShortcut("Ctrl+D")
         req_menu.addSeparator()
         req_menu.addAction("Импорт из cURL…", self.import_curl)
+        code_action = req_menu.addAction("Сгенерировать код…", self.export_code)
+        code_action.setShortcut("Ctrl+G")
+        code_action.setStatusTip("cURL, Python, JavaScript, HTTPie")
 
         help_menu = menubar.addMenu("Справка")
         help_menu.addAction("О программе", self._show_about)
@@ -137,10 +162,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.delete_workspace_requested.connect(self.delete_workspace)
         self.sidebar.edit_variables_requested.connect(self.edit_variables)
 
+        # Контроллер: отмена/повтор перестраивают дерево и требуют сохранения.
+        self.controller.structure_changed.connect(self._on_structure_restored)
+        self.controller.modified.connect(self._schedule_save)
+
         # Редактор.
         self.editor.modified.connect(self._schedule_save)
         self.editor.name_changed.connect(self.sidebar.update_item_name)
         self.editor.send_requested.connect(self._on_send)
+        self.editor.cancel_requested.connect(self._on_cancel)
 
     # -- начальная загрузка -------------------------------------------------
     def _load_initial_data(self) -> None:
@@ -161,6 +191,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- управление Workspace ----------------------------------------------
     def _set_current_workspace(self, ws: models.Workspace, select_first: bool = False) -> None:
         self.current_ws = ws
+        self.controller.set_workspace(ws)
         self.sidebar.set_workspace(ws)
         self.editor.set_request(None)
         self.response.clear()
@@ -233,31 +264,59 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         dialog = EnvironmentsDialog(self.current_ws, self)
         if dialog.exec():
-            envs = dialog.environments()
-            self.current_ws.environments = envs or {models.DEFAULT_ENV: {}}
-            self.current_ws.set_active_env(dialog.active())
-            if self.current_ws.active_env not in self.current_ws.environments:
-                self.current_ws.active_env = next(iter(self.current_ws.environments))
-            self.storage.save_workspace(self.current_ws)
+            with self.controller.transaction("Изменение окружений"):
+                envs = dialog.environments()
+                self.current_ws.environments = envs or {models.DEFAULT_ENV: {}}
+                self.current_ws.secret_vars = dialog.secret_vars()
+                self.current_ws.set_active_env(dialog.active())
+                if self.current_ws.active_env not in self.current_ws.environments:
+                    self.current_ws.active_env = next(iter(self.current_ws.environments))
             self.sidebar.set_environments(self.current_ws)
+            self._refresh_known_variables()
             self.status.showMessage("Окружения сохранены", 3000)
+
+    def _refresh_known_variables(self) -> None:
+        """Сообщить редактору, какие переменные доступны (для подсветки)."""
+        names = self.current_ws.variables.keys() if self.current_ws is not None else []
+        self.editor.set_known_variables(names)
 
     def _on_env_switched(self, name: str) -> None:
         if self.current_ws is None:
             return
         self.current_ws.set_active_env(name)
+        self._refresh_known_variables()
         self._schedule_save()
         self.status.showMessage(f"Активное окружение: {name}", 3000)
 
     def _on_copy_curl(self, req) -> None:
+        self._show_code(req, codegen.LANG_CURL)
+
+    def export_code(self) -> None:
+        """Сгенерировать код текущего запроса (cURL/Python/JS/HTTPie)."""
+        self._show_code(self.editor.current_request(), codegen.LANG_CURL)
+
+    def _show_code(self, req, language: str) -> None:
         if req is None or self.current_ws is None:
+            self.status.showMessage("Выберите запрос", 3000)
             return
-        try:
-            command = curl.to_curl(req, self.current_ws.variables)
-        except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.warning(self, "Copy as cURL", f"Не удалось сформировать команду: {exc}")
+        dialog = CodeExportDialog(req, self.current_ws.variables, language, self)
+        dialog.exec()
+
+    def quick_open(self) -> None:
+        """Быстрый переход к запросу по имени или URL (Ctrl+P)."""
+        if self.current_ws is None:
             return
-        CurlExportDialog(command, self).exec()
+        items = list(self._iter_all_requests())
+        if not items:
+            self.status.showMessage("В этом рабочем пространстве нет запросов", 3000)
+            return
+        dialog = QuickOpenDialog(items, self)
+        if dialog.exec():
+            req = dialog.selected_request()
+            if req is not None:
+                self.sidebar.select_request(req)
+                self.editor.set_request(req)
+                self._on_request_selected(req)
 
     def import_curl(self) -> None:
         if self.current_ws is None:
@@ -288,14 +347,32 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Экспорт", default, self._FILE_FILTER)
         if not path:
             return
+
+        # Файл предназначен для обмена — по умолчанию без секретов.
+        include_secrets = False
+        preview = share.export_dict(obj, include_secrets=False)
+        stripped = preview.get("stripped")
+        if stripped:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Секреты в экспорте",
+                "Из файла будут удалены:\n  • " + "\n  • ".join(stripped) +
+                "\n\nЭто безопасно для передачи другим людям.\n\n"
+                "Включить секреты в файл? (только для личной резервной копии)",
+                QtWidgets.QMessageBox.StandardButton.No | QtWidgets.QMessageBox.StandardButton.Yes,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            include_secrets = answer == QtWidgets.QMessageBox.StandardButton.Yes
+
         try:
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(share.export_str(obj))
+                fh.write(share.export_str(obj, include_secrets=include_secrets))
         except OSError as exc:
             QtWidgets.QMessageBox.warning(self, "Экспорт", f"Не удалось сохранить файл:\n{exc}")
             return
         labels = {share.KIND_WORKSPACE: "рабочее пространство", share.KIND_FOLDER: "папка", share.KIND_REQUEST: "запрос"}
-        self.status.showMessage(f"Экспортировано ({labels.get(kind, kind)}): {path}", 5000)
+        suffix = " (с секретами)" if include_secrets else " (без секретов)"
+        self.status.showMessage(f"Экспортировано ({labels.get(kind, kind)}){suffix}: {path}", 6000)
 
     def _export_workspace(self) -> None:
         if self.current_ws is not None:
@@ -363,6 +440,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_request_selected(self, req) -> None:
         self.editor.set_request(req)
+        self._refresh_known_variables()
         # Показываем историю ответов выбранного запроса (если есть).
         history = self._history.get(req.id) if req is not None else None
         if history:
@@ -375,9 +453,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_timer.start()
 
     def _do_autosave(self) -> None:
-        if self.current_ws is not None:
+        if self.current_ws is None:
+            return
+        try:
             self.storage.save_workspace(self.current_ws)
-            self.status.showMessage("Сохранено", 1500)
+        except OSError as exc:
+            # Молча терять данные нельзя: сообщаем явно (один диалог на сессию,
+            # чтобы не заваливать пользователя при каждой правке).
+            self.status.showMessage(f"НЕ СОХРАНЕНО: {exc.strerror or exc}", 10000)
+            if not self._save_error_shown:
+                self._save_error_shown = True
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Не удалось сохранить",
+                    "Не получилось записать рабочее пространство на диск:\n"
+                    f"{exc}\n\nИзменения остаются в памяти. Освободите место или "
+                    "проверьте права доступа, затем сохраните через «Файл → Сохранить сейчас».",
+                )
+            return
+        self._save_error_shown = False
+        self.status.showMessage("Сохранено", 1500)
+
+    def _on_structure_restored(self) -> None:
+        """Дерево изменилось извне (отмена/повтор) — перестроить и вернуть выбор."""
+        current = self.editor.current_request()
+        current_id = current.id if current is not None else None
+        self.sidebar.set_workspace(self.current_ws)
+        self.sidebar.set_environments(self.current_ws)
+        restored = self._find_request_by_id(current_id) if current_id else None
+        if restored is not None:
+            self.sidebar.select_request(restored)
+            self.editor.set_request(restored)
+        else:
+            self.editor.set_request(None)
+            self.response.clear()
+
+    def _iter_all_requests(self, container=None):
+        """Перебрать все запросы текущего Workspace с путями («Папка/Имя»)."""
+        if container is None:
+            container = self.current_ws
+        if container is None:
+            return
+        stack = [(container, "")]
+        while stack:
+            node, prefix = stack.pop()
+            for req in node.requests:
+                yield prefix + req.name, req
+            for folder in node.folders:
+                stack.append((folder, prefix + folder.name + "/"))
+
+    def _find_request_by_id(self, req_id: str):
+        for _, req in self._iter_all_requests():
+            if req.id == req_id:
+                return req
+        return None
 
     def _flush_save(self) -> None:
         if self._save_timer.isActive():
@@ -414,29 +543,69 @@ class MainWindow(QtWidgets.QMainWindow):
         timeout = req.timeout if req.timeout else self.timeout
 
         self.response.show_loading()
+        self.response.show_sent_request(method, url, kwargs)
         self.editor.set_sending(True)
         self.status.showMessage(f"Отправка {method} {url}…")
         self._sending_req = req
         self._add_url_history(url)
 
-        self._runner = RequestRunner(method, url, kwargs, timeout=timeout, parent=self)
+        self._runner = RequestRunner(
+            method, url, kwargs, timeout=timeout, session=self.session, parent=self
+        )
         self._runner.succeeded.connect(self._on_response)
         self._runner.failed.connect(self._on_request_error)
+        self._runner.cancelled.connect(self._on_request_cancelled)
         self._runner.finished.connect(self._on_runner_finished)
         self._runner.start()
 
+    def _on_cancel(self) -> None:
+        """Отменить текущий запрос (кнопка Cancel)."""
+        if self._runner is not None and self._runner.isRunning():
+            self._runner.cancel()
+            self.status.showMessage("Запрос отменён", 3000)
+            self.editor.set_sending(False)
+
+    def _on_request_cancelled(self) -> None:
+        self.response.show_error("Запрос отменён.")
+        self.status.showMessage("Запрос отменён", 3000)
+
     def _on_response(self, data) -> None:
-        if self._sending_req is not None:
-            history = self._history.setdefault(self._sending_req.id, [])
+        req = self._sending_req
+        if req is not None:
+            history = self._history.setdefault(req.id, [])
             history.append(data)
-            if len(history) > 15:
-                del history[0]
+            # Ограничиваем и число ответов, и объём памяти: у старых записей
+            # тело выбрасываем, оставляя статус/время/заголовки.
+            del history[:-_HISTORY_PER_REQUEST]
+            for old in history[:-_HISTORY_WITH_BODY]:
+                old.drop_body()
             self.response.show_response(data, history)
         else:
             self.response.show_response(data)
-        self.status.showMessage(
-            f"{data.status_line} · {data.elapsed_ms:.0f} мс", 5000
+
+        message = f"{data.status_line} · {data.elapsed_ms:.0f} мс"
+        if data.truncated:
+            message += " · тело обрезано по лимиту"
+        if req is not None:
+            captured = self._apply_captures(req, data)
+            if captured:
+                message += " · переменные: " + ", ".join(captured)
+        self.status.showMessage(message, 6000)
+
+    def _apply_captures(self, req: models.Request, data) -> List[str]:
+        """Извлечь значения из ответа в переменные активного окружения."""
+        if not req.captures or self.current_ws is None:
+            return []
+        values, problems = capture.apply_captures(
+            req.captures, data.status_code, data.headers, data.text
         )
+        if values:
+            with self.controller.transaction("Извлечение переменных из ответа"):
+                env = self.current_ws.variables
+                env.update(values)
+        if problems:
+            self.response.show_capture_problems(problems)
+        return list(values)
 
     def _add_url_history(self, url: str) -> None:
         if not url:
@@ -487,5 +656,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         if self._runner is not None and self._runner.isRunning():
+            self._runner.cancel()
             self._runner.wait(2000)
+        try:
+            self.session.close()
+        except Exception:
+            pass
         super().closeEvent(event)

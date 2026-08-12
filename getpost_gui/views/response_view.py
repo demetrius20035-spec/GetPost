@@ -70,6 +70,13 @@ class ResponseView(QtWidgets.QWidget):
         hist_row.addWidget(self.history_combo, 1)
         layout.addLayout(hist_row)
 
+        # Сообщения о проблемах извлечения переменных (вкладка Capture).
+        self.notice = QtWidgets.QLabel("")
+        self.notice.setWordWrap(True)
+        self.notice.setStyleSheet("color: #b26a00;")
+        self.notice.setVisible(False)
+        layout.addWidget(self.notice)
+
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_body_tab(), "Response")
         self.tabs.addTab(self._build_preview_tab(), "Preview")
@@ -78,6 +85,12 @@ class ResponseView(QtWidgets.QWidget):
         self.time_details = QtWidgets.QPlainTextEdit()
         self.time_details.setReadOnly(True)
         self.tabs.addTab(self.time_details, "Time")
+        # «Что реально ушло» — отладка запроса без догадок.
+        self.sent_view = QtWidgets.QPlainTextEdit()
+        self.sent_view.setReadOnly(True)
+        self.sent_view.setFont(monospace_font())
+        self.sent_view.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.tabs.addTab(self.sent_view, "Request")
         layout.addWidget(self.tabs, 1)
 
     def _build_body_tab(self) -> QtWidgets.QWidget:
@@ -214,9 +227,61 @@ class ResponseView(QtWidgets.QWidget):
         self.preview_stack.setCurrentIndex(2)
 
     def show_response(self, data: ResponseData, history: Optional[List[ResponseData]] = None) -> None:
+        self.notice.setVisible(False)
         self._history = list(history) if history else [data]
         self._set_history_combo(select_last=True)
         self._render_data(data)
+
+    def show_capture_problems(self, problems: List[str]) -> None:
+        """Показать, какие правила извлечения переменных не сработали."""
+        if not problems:
+            self.notice.setVisible(False)
+            return
+        self.notice.setText("⚠ Извлечение переменных: " + "; ".join(problems))
+        self.notice.setVisible(True)
+
+    def show_sent_request(self, method: str, url: str, kwargs: dict) -> None:
+        """Показать то, что реально отправляется (вкладка «Request»)."""
+        lines = [f"{method} {url}", ""]
+        params = kwargs.get("params")
+        if params:
+            lines.append("Query:")
+            lines += [f"  {k} = {v}" for k, v in params]
+            lines.append("")
+        headers = kwargs.get("headers") or {}
+        if headers:
+            lines.append("Headers:")
+            lines += [f"  {k}: {v}" for k, v in headers.items()]
+            lines.append("")
+        auth = kwargs.get("auth")
+        if auth is not None and hasattr(auth, "username"):
+            lines.append(f"Basic auth: {auth.username}:***")
+            lines.append("")
+
+        data = kwargs.get("data")
+        if isinstance(data, (bytes, bytearray)):
+            lines.append(f"Body ({len(data)} байт):")
+            lines.append(data.decode("utf-8", "replace"))
+        elif isinstance(data, list):
+            lines.append("Body (x-www-form-urlencoded):")
+            lines += [f"  {k} = {v}" for k, v in data]
+        elif kwargs.get("files"):
+            lines.append("Body (multipart/form-data):")
+            for key, filetuple in kwargs["files"]:
+                filename, content = filetuple[0], filetuple[1]
+                if filename:
+                    lines.append(f"  {key} = файл «{filename}» ({len(content)} байт)")
+                else:
+                    lines.append(f"  {key} = {content}")
+        else:
+            lines.append("Body: —")
+
+        lines.append("")
+        lines.append(
+            f"Редиректы: {'да' if kwargs.get('allow_redirects', True) else 'нет'} · "
+            f"Проверка TLS: {'да' if kwargs.get('verify', True) else 'нет'}"
+        )
+        self.sent_view.setPlainText("\n".join(lines))
 
     # -- история ------------------------------------------------------------
     def _set_history_combo(self, select_last: bool = False) -> None:

@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import mimetypes
 import os
 import re
 import sys
@@ -49,13 +48,13 @@ import requests
 
 # Подключаем общее ядро из соседнего пакета (без зависимости от Qt).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from getpost_gui import http_client, models, share, storage  # noqa: E402
+from getpost_gui import capture, codegen, http_client, models, share, storage  # noqa: E402
 from getpost_gui.variables import substitute  # noqa: E402
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
-SUBCOMMANDS = {"send", "run", "ls", "list", "export", "import"}
+SUBCOMMANDS = {"send", "run", "ls", "list", "export", "import", "code"}
 
 # Коды возврата.
 EXIT_OK = 0
@@ -182,21 +181,16 @@ def collect_variables(args) -> dict:
 
 
 def build_multipart_files(items, variables):
-    """Собрать ``files`` для multipart/form-data, поддерживая ``key=@path``."""
-    files = []
+    """Собрать ``files`` для multipart/form-data, поддерживая ``key=@path``.
+
+    Сама сборка живёт в ядре (:func:`http_client.build_multipart`) — она общая
+    с GUI, поэтому поведение гарантированно одинаковое.
+    """
+    pairs = []
     for item in items:
         key, value = _split_pair(item, "=", "поля")
-        key = substitute(key, variables)
-        value = substitute(value, variables)
-        if value.startswith("@"):
-            path = value[1:]
-            ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
-            with open(path, "rb") as fh:
-                content = fh.read()
-            files.append((key, (os.path.basename(path), content, ctype)))
-        else:
-            files.append((key, (None, value)))
-    return files
+        pairs.append((substitute(key, variables), substitute(value, variables)))
+    return http_client.build_multipart(pairs)
 
 
 def request_from_args(args) -> models.Request:
@@ -239,7 +233,25 @@ def request_from_args(args) -> models.Request:
 # --------------------------------------------------------------------------
 # Отправка и вывод ответа
 # --------------------------------------------------------------------------
-def send_request(req: models.Request, variables: dict, args, multipart_items=None) -> int:
+def apply_captures_cli(req, resp, ws, args) -> None:
+    """Записать извлечённые из ответа значения в переменные Workspace."""
+    if not getattr(req, "captures", None) or ws is None:
+        return
+    values, problems = capture.apply_captures(
+        req.captures, resp.status_code, list(resp.headers.items()), resp.text
+    )
+    for message in problems:
+        info(_c(f"⚠ {message}", Ansi.YELLOW))
+    if not values:
+        return
+    ws.variables.update(values)
+    storage.Storage().save_workspace(ws)
+    if not args.silent:
+        info(_c("Переменные обновлены: " + ", ".join(values), Ansi.GREEN))
+
+
+def send_request(req: models.Request, variables: dict, args, multipart_items=None,
+                 workspace=None) -> int:
     method, url, kwargs = http_client.build_request_kwargs(req, variables)
     if not url:
         info(_c("Ошибка: пустой URL", Ansi.RED))
@@ -282,6 +294,7 @@ def send_request(req: models.Request, variables: dict, args, multipart_items=Non
         return EXIT_REQUEST
 
     _print_response(resp, args)
+    apply_captures_cli(req, resp, workspace, args)
 
     if args.fail and resp.status_code >= 400:
         return EXIT_HTTP
@@ -446,7 +459,7 @@ def cmd_run(args) -> int:
 
     if not args.silent:
         info(_c(f"# {ws.name} → {req.name}  [{req.method}]  {req.url}", Ansi.DIM))
-    return send_request(req, variables, args)
+    return send_request(req, variables, args, workspace=ws)
 
 
 def cmd_ls(args) -> int:
@@ -483,6 +496,32 @@ def cmd_ls(args) -> int:
     for path, req in iter_requests(ws):
         method = _c(f"{req.method:6}", status_color(200), Ansi.BOLD)
         print(f"  {method} {path}  {_c(req.url, Ansi.GREY)}")
+    return EXIT_OK
+
+
+def cmd_code(args) -> int:
+    """Сгенерировать код запроса (cURL/Python/JavaScript/HTTPie)."""
+    ws = find_workspace(args.workspace)
+    if ws is None:
+        info(_c(f"Рабочее пространство «{args.workspace}» не найдено.", Ansi.RED))
+        return EXIT_ERROR
+    matches = find_request(ws, args.request)
+    if len(matches) != 1:
+        info(_c(f"Запрос «{args.request}»: найдено совпадений — {len(matches)}.", Ansi.RED))
+        return EXIT_ERROR
+    if args.env:
+        ws.set_active_env(args.env)
+    try:
+        code = codegen.generate(args.lang, matches[0][1], ws.variables)
+    except ValueError as exc:
+        info(_c(str(exc), Ansi.RED))
+        return EXIT_ERROR
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(code + "\n")
+        info(_c(f"Код ({args.lang}) сохранён в {args.output}", Ansi.GREEN))
+    else:
+        print(code)
     return EXIT_OK
 
 
@@ -626,6 +665,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--folder", metavar="NAME", help="экспортировать конкретную папку")
     p_export.add_argument("-o", "--output", metavar="FILE", help="файл (по умолчанию — stdout)")
     p_export.set_defaults(func=cmd_export)
+
+    # code
+    p_code = sub.add_parser("code", help="сгенерировать код запроса на выбранном языке")
+    p_code.add_argument("workspace", help="имя или id рабочего пространства")
+    p_code.add_argument("request", help="имя или путь запроса")
+    p_code.add_argument(
+        "--lang", default=codegen.LANG_CURL,
+        choices=[key for key, _ in codegen.LANGUAGES],
+        help="язык (по умолчанию curl)",
+    )
+    p_code.add_argument("--env", metavar="NAME", help="окружение для подстановки переменных")
+    p_code.add_argument("-o", "--output", metavar="FILE", help="файл (по умолчанию — stdout)")
+    p_code.set_defaults(func=cmd_code)
 
     # import
     p_import = sub.add_parser("import", help="импортировать из файла обмена")

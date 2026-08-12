@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from ..http_client import FILE_PREFIX as HTTP_FILE_PREFIX
 from ..qtcompat import Qt, QtGui, QtWidgets, Signal
 
 
@@ -19,17 +20,46 @@ def monospace_font() -> QtGui.QFont:
     return font
 
 
+MASK_TEXT = "••••••••"
+
+
 class KeyValueTable(QtWidgets.QWidget):
-    """Таблица пар ключ-значение с автодобавлением пустой строки."""
+    """Таблица пар ключ-значение с автодобавлением пустой строки.
+
+    Дополнительные режимы:
+
+    * ``secret_column`` — колонка «секрет» (значение маскируется и не попадает
+      в экспорт);
+    * ``file_column``   — кнопка выбора файла, подставляющая ``@путь``
+      (так поле уходит как файл в multipart/form-data).
+    """
 
     changed = Signal()
 
-    def __init__(self, key_label: str = "Key", value_label: str = "Value", parent=None):
+    def __init__(self, key_label: str = "Key", value_label: str = "Value", parent=None,
+                 secret_column: bool = False, file_column: bool = False):
         super().__init__(parent)
         self._mutating = False
+        self._secret_column = secret_column
+        self._file_column = file_column
+        self._masked = False
+        # Реальные значения секретных строк, пока они скрыты маской.
+        self._hidden_values: dict = {}
 
-        self.table = QtWidgets.QTableWidget(0, 4, self)
-        self.table.setHorizontalHeaderLabels(["", key_label, value_label, ""])
+        columns = ["", key_label, value_label]
+        self._col_secret = -1
+        self._col_file = -1
+        if secret_column:
+            self._col_secret = len(columns)
+            columns.append("🔒")
+        if file_column:
+            self._col_file = len(columns)
+            columns.append("")
+        self._col_delete = len(columns)
+        columns.append("")
+
+        self.table = QtWidgets.QTableWidget(0, len(columns), self)
+        self.table.setHorizontalHeaderLabels(columns)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.table.setEditTriggers(
@@ -40,10 +70,13 @@ class KeyValueTable(QtWidgets.QWidget):
         )
 
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(self.table.columnCount()):
+            mode = (
+                QtWidgets.QHeaderView.ResizeMode.Stretch
+                if col in (1, 2)
+                else QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+            )
+            header.setSectionResizeMode(col, mode)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -67,26 +100,62 @@ class KeyValueTable(QtWidgets.QWidget):
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         return item
 
-    def _insert_row(self, row: int, enabled: bool, key: str, value: str) -> None:
+    def _insert_row(self, row: int, enabled: bool, key: str, value: str,
+                    secret: bool = False) -> None:
         self.table.insertRow(row)
         self.table.setItem(row, 0, self._make_check_item(enabled))
         self.table.setItem(row, 1, self._make_text_item(key))
         self.table.setItem(row, 2, self._make_text_item(value))
 
+        if self._col_secret >= 0:
+            item = self._make_check_item(secret)
+            item.setToolTip("Секрет: значение маскируется и не попадает в экспорт")
+            self.table.setItem(row, self._col_secret, item)
+
+        if self._col_file >= 0:
+            pick = QtWidgets.QToolButton(self.table)
+            pick.setText("📎")
+            pick.setAutoRaise(True)
+            pick.setToolTip("Выбрать файл для отправки")
+            pick.clicked.connect(lambda: self._pick_file(pick))
+            self.table.setCellWidget(row, self._col_file, pick)
+
         btn = QtWidgets.QToolButton(self.table)
-        btn.setText("✕")  # ✕
+        btn.setText("✕")
         btn.setAutoRaise(True)
         btn.setToolTip("Удалить строку")
         btn.clicked.connect(lambda: self._remove_button_row(btn))
-        self.table.setCellWidget(row, 3, btn)
+        self.table.setCellWidget(row, self._col_delete, btn)
 
     def _append_blank_row(self) -> None:
         self._insert_row(self.table.rowCount(), True, "", "")
 
+    # -- выбор файла (multipart) --------------------------------------------
+    def _row_of_widget(self, widget, column: int) -> int:
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, column) is widget:
+                return row
+        return -1
+
+    def _pick_file(self, button) -> None:
+        row = self._row_of_widget(button, self._col_file)
+        if row < 0:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Файл для отправки")
+        if not path:
+            return
+        value_item = self.table.item(row, 2)
+        if value_item is not None:
+            # Соглашение "@путь" совпадает с CLI и обрабатывается ядром.
+            value_item.setText(f"{HTTP_FILE_PREFIX}{path}")
+        key_item = self.table.item(row, 1)
+        if key_item is not None and not key_item.text().strip():
+            key_item.setText("file")
+
     # -- реакции на изменения ----------------------------------------------
     def _remove_button_row(self, btn: QtWidgets.QToolButton) -> None:
         for row in range(self.table.rowCount()):
-            if self.table.cellWidget(row, 3) is btn:
+            if self.table.cellWidget(row, self._col_delete) is btn:
                 # Не даём удалить единственную (пустую) строку — просто чистим её.
                 if self.table.rowCount() == 1:
                     self.set_items([])
@@ -119,9 +188,56 @@ class KeyValueTable(QtWidgets.QWidget):
             self._mutating = False
         self.changed.emit()
 
+    # -- секреты и маскирование ---------------------------------------------
+    def _is_secret_row(self, row: int) -> bool:
+        if self._col_secret < 0:
+            return False
+        item = self.table.item(row, self._col_secret)
+        return bool(item) and item.checkState() == Qt.CheckState.Checked
+
+    def set_secret_masked(self, masked: bool) -> None:
+        """Скрыть/показать значения секретных строк.
+
+        Пока значение скрыто, ячейка недоступна для правки — так маска не может
+        затереть настоящее значение.
+        """
+        if self._col_secret < 0:
+            return
+        self._mutating = True
+        try:
+            if masked and not self._masked:
+                self._hidden_values = {}
+                for row in range(self.table.rowCount()):
+                    value_item = self.table.item(row, 2)
+                    if value_item is None or not self._is_secret_row(row):
+                        continue
+                    real = value_item.text()
+                    if not real:
+                        continue
+                    self._hidden_values[row] = real
+                    value_item.setText(MASK_TEXT)
+                    value_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            elif not masked and self._masked:
+                for row, real in self._hidden_values.items():
+                    value_item = self.table.item(row, 2)
+                    if value_item is not None:
+                        value_item.setText(real)
+                        value_item.setFlags(
+                            Qt.ItemFlag.ItemIsEnabled
+                            | Qt.ItemFlag.ItemIsEditable
+                            | Qt.ItemFlag.ItemIsSelectable
+                        )
+                self._hidden_values = {}
+            self._masked = masked
+        finally:
+            self._mutating = False
+
     # -- публичный API ------------------------------------------------------
     def get_items(self) -> List[Dict[str, Any]]:
-        """Вернуть непустые строки в виде списка словарей."""
+        """Вернуть непустые строки в виде списка словарей.
+
+        Значения скрытых маской секретов возвращаются настоящими.
+        """
         items: List[Dict[str, Any]] = []
         for row in range(self.table.rowCount()):
             if self._row_is_empty(row):
@@ -129,13 +245,17 @@ class KeyValueTable(QtWidgets.QWidget):
             check = self.table.item(row, 0)
             key = self.table.item(row, 1)
             value = self.table.item(row, 2)
-            items.append(
-                {
-                    "enabled": check.checkState() == Qt.CheckState.Checked if check else True,
-                    "key": key.text() if key else "",
-                    "value": value.text() if value else "",
-                }
-            )
+            text = value.text() if value else ""
+            if self._masked and row in self._hidden_values:
+                text = self._hidden_values[row]
+            entry = {
+                "enabled": check.checkState() == Qt.CheckState.Checked if check else True,
+                "key": key.text() if key else "",
+                "value": text,
+            }
+            if self._col_secret >= 0:
+                entry["secret"] = self._is_secret_row(row)
+            items.append(entry)
         return items
 
     def add_item(self, key: str, value: str = "", enabled: bool = True) -> None:
@@ -153,12 +273,16 @@ class KeyValueTable(QtWidgets.QWidget):
         self._mutating = True
         try:
             self.table.setRowCount(0)
+            # Строки заменяются — прежние скрытые значения больше не актуальны.
+            self._hidden_values = {}
+            self._masked = False
             for it in items or []:
                 self._insert_row(
                     self.table.rowCount(),
                     bool(it.get("enabled", True)),
                     str(it.get("key", "")),
                     str(it.get("value", "")),
+                    secret=bool(it.get("secret", False)),
                 )
             self._append_blank_row()
         finally:

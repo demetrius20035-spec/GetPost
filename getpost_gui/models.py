@@ -74,6 +74,16 @@ def _coerce_choice(value: Any, choices: List[str], default: str) -> str:
     return value if value in choices else default
 
 
+def _copy_kv_list(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Скопировать список пар «ключ-значение».
+
+    ``to_dict`` обязан возвращать независимый снимок: иначе изменения в
+    сериализованных данных (например, вычистка секретов при экспорте) утекали
+    бы обратно в живую модель.
+    """
+    return [dict(it) for it in items]
+
+
 def normalize_kv_list(raw: Any) -> List[Dict[str, Any]]:
     """Нормализовать список пар «ключ-значение».
 
@@ -121,6 +131,9 @@ class Request:
         self.follow_redirects: bool = True
         self.verify_ssl: bool = True
         self.timeout: Optional[float] = None
+        # Правила извлечения значений из ответа в переменные окружения:
+        # [{"enabled", "name", "source", "expr"}, ...]
+        self.captures: List[Dict[str, Any]] = []
 
     # -- сериализация -------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -129,12 +142,12 @@ class Request:
             "name": self.name,
             "method": self.method,
             "url": self.url,
-            "params": self.params,
-            "headers": self.headers,
+            "params": _copy_kv_list(self.params),
+            "headers": _copy_kv_list(self.headers),
             "body_type": self.body_type,
             "body_raw": self.body_raw,
             "body_raw_lang": self.body_raw_lang,
-            "body_form": self.body_form,
+            "body_form": _copy_kv_list(self.body_form),
             "auth_type": self.auth_type,
             "auth_basic_username": self.auth_basic_username,
             "auth_basic_password": self.auth_basic_password,
@@ -142,6 +155,7 @@ class Request:
             "follow_redirects": self.follow_redirects,
             "verify_ssl": self.verify_ssl,
             "timeout": self.timeout,
+            "captures": _copy_kv_list(self.captures),
         }
 
     @classmethod
@@ -163,6 +177,7 @@ class Request:
         r.verify_ssl = bool(d.get("verify_ssl", True))
         timeout = d.get("timeout")
         r.timeout = float(timeout) if isinstance(timeout, (int, float)) else None
+        r.captures = normalize_captures(d.get("captures"))
         return r
 
     def clone(self, new_name: Optional[str] = None) -> "Request":
@@ -215,6 +230,34 @@ class Folder:
 
 DEFAULT_ENV = "Default"
 
+# Версия схемы файлов. 1 — одиночное поле variables; 2 — окружения, captures.
+SCHEMA_VERSION = 2
+
+# --- Источники для извлечения значений из ответа (capture) -----------------
+CAPTURE_JSON = "json"      # путь вида data.items[0].token
+CAPTURE_HEADER = "header"  # имя заголовка ответа
+CAPTURE_STATUS = "status"  # код статуса
+CAPTURE_BODY = "body"      # всё тело как текст
+CAPTURE_SOURCES = [CAPTURE_JSON, CAPTURE_HEADER, CAPTURE_STATUS, CAPTURE_BODY]
+
+
+def normalize_captures(raw: Any) -> List[Dict[str, Any]]:
+    """Нормализовать список правил извлечения переменных из ответа."""
+    items: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            items.append(
+                {
+                    "enabled": bool(it.get("enabled", True)),
+                    "name": str(it.get("name", "")),
+                    "source": _coerce_choice(it.get("source"), CAPTURE_SOURCES, CAPTURE_JSON),
+                    "expr": str(it.get("expr", "")),
+                }
+            )
+    return items
+
 
 class Workspace:
     """Рабочее пространство — корень иерархии.
@@ -230,6 +273,9 @@ class Workspace:
         # Окружения: {"Default": {"base_url": "..."}, "Prod": {...}}
         self.environments: Dict[str, Dict[str, str]] = {DEFAULT_ENV: {}}
         self.active_env: str = DEFAULT_ENV
+        # Имена переменных, помеченных как секретные: маскируются в интерфейсе
+        # и по умолчанию не попадают в экспорт.
+        self.secret_vars: List[str] = []
         self.folders: List[Folder] = []
         self.requests: List[Request] = []
         # Путь к файлу на диске (заполняется хранилищем, не сериализуется).
@@ -277,13 +323,26 @@ class Workspace:
             return True
         return False
 
+    # -- секретные переменные ----------------------------------------------
+    def is_secret(self, name: str) -> bool:
+        return name in self.secret_vars
+
+    def set_secret(self, name: str, secret: bool) -> None:
+        if secret and name not in self.secret_vars:
+            self.secret_vars.append(name)
+        elif not secret and name in self.secret_vars:
+            self.secret_vars.remove(name)
+
     # -- сериализация -------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "schema_version": SCHEMA_VERSION,
             "id": self.id,
             "name": self.name,
-            "environments": self.environments,
+            # Копии, а не ссылки: снимок должен быть независим от модели.
+            "environments": {name: dict(v) for name, v in self.environments.items()},
             "active_env": self.active_env,
+            "secret_vars": list(self.secret_vars),
             "folders": [f.to_dict() for f in self.folders],
             "requests": [r.to_dict() for r in self.requests],
         }
@@ -309,6 +368,9 @@ class Workspace:
         if not ws.environments:
             ws.environments = {DEFAULT_ENV: {}}
             ws.active_env = DEFAULT_ENV
+        secrets = d.get("secret_vars")
+        if isinstance(secrets, list):
+            ws.secret_vars = [str(s) for s in secrets]
         ws.folders = [Folder.from_dict(x) for x in d.get("folders", []) if isinstance(x, dict)]
         ws.requests = [Request.from_dict(x) for x in d.get("requests", []) if isinstance(x, dict)]
         return ws

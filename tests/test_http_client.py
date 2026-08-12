@@ -1,4 +1,8 @@
+import os
+import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from getpost_gui import http_client, models
 
@@ -114,6 +118,90 @@ class TestBuildRequestKwargs(unittest.TestCase):
     def test_empty_url_raises_on_perform(self):
         with self.assertRaises(ValueError):
             http_client.perform_prepared("GET", "", {})
+
+
+class TestMultipartFiles(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="getpost_mp_")
+        self.path = os.path.join(self.tmp, "payload.txt")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("FILEDATA")
+
+    def test_file_value_read(self):
+        files = http_client.build_multipart([("doc", f"@{self.path}"), ("note", "hi")])
+        self.assertEqual(files[0][0], "doc")
+        self.assertEqual(files[0][1][0], "payload.txt")   # имя файла
+        self.assertEqual(files[0][1][1], b"FILEDATA")     # содержимое
+        self.assertEqual(files[1][1], (None, "hi"))       # обычное поле
+
+    def test_form_data_request_uses_files(self):
+        req = models.Request("m")
+        req.method = "POST"
+        req.url = "http://x"
+        req.body_type = models.BODY_FORM_DATA
+        req.body_form = [{"enabled": True, "key": "f", "value": f"@{self.path}"}]
+        _, _, kwargs = build(req)
+        self.assertEqual(kwargs["files"][0][1][1], b"FILEDATA")
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            http_client.build_multipart([("doc", "@/no/such/file.txt")])
+
+    def test_is_file_value(self):
+        self.assertTrue(http_client.is_file_value("@/tmp/x"))
+        self.assertFalse(http_client.is_file_value("@"))
+        self.assertFalse(http_client.is_file_value("plain"))
+
+
+class TestStreamingAndLimits(unittest.TestCase):
+    """Потоковое чтение: лимит размера и отмена (на локальном сервере)."""
+
+    @classmethod
+    def setUpClass(cls):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                payload = b"x" * 200_000
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        cls.server = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/big"
+
+    def test_full_read(self):
+        data = http_client.perform_prepared("GET", self.url(), {})
+        self.assertEqual(data.status_code, 200)
+        self.assertEqual(data.size_bytes, 200_000)
+        self.assertFalse(data.truncated)
+
+    def test_truncated_by_limit(self):
+        data = http_client.perform_prepared("GET", self.url(), {}, max_bytes=1000)
+        self.assertTrue(data.truncated)
+        self.assertLessEqual(len(data.content), 1000)
+
+    def test_cancel_stops_download(self):
+        with self.assertRaises(http_client.Cancelled):
+            http_client.perform_prepared("GET", self.url(), {}, should_cancel=lambda: True)
+
+    def test_drop_body_frees_memory(self):
+        data = http_client.perform_prepared("GET", self.url(), {})
+        data.drop_body()
+        self.assertEqual(data.content, b"")
+        self.assertEqual(data.text, "")
+        self.assertEqual(data.size_bytes, 200_000)  # метаданные остаются
 
 
 class TestResponseData(unittest.TestCase):

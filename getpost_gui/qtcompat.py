@@ -46,4 +46,10 @@ if QT_API is None:  # pragma: no cover - зависит от окружения
 # Удобные псевдонимы для часто используемых перечислений Qt.
 Qt = QtCore.Qt
 
+# В Qt6 QUndoStack/QUndoCommand живут в QtGui, но отдельные сборки биндингов
+# экспортируют их только из QtWidgets. Нормализуем доступ до использования.
+for _name in ("QUndoCommand", "QUndoStack"):
+    if not hasattr(QtGui, _name) and hasattr(QtWidgets, _name):  # pragma: no cover
+        setattr(QtGui, _name, getattr(QtWidgets, _name))
+
 __all__ = ["QtCore", "QtGui", "QtWidgets", "Signal", "Slot", "Qt", "QT_API"]

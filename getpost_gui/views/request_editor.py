@@ -12,6 +12,7 @@ from typing import Optional
 from .. import models
 from ..highlighter import JsonHighlighter, XmlHighlighter
 from ..qtcompat import Qt, QtWidgets, Signal
+from ..variables import find_variables
 from .widgets import KeyValueTable, monospace_font
 
 
@@ -19,6 +20,7 @@ class RequestEditor(QtWidgets.QWidget):
     """Редактор одного HTTP-запроса."""
 
     send_requested = Signal()
+    cancel_requested = Signal()
     modified = Signal()
     name_changed = Signal(object)  # передаётся изменённый Request
 
@@ -27,6 +29,9 @@ class RequestEditor(QtWidgets.QWidget):
         self._req: Optional[models.Request] = None
         self._loading = False
         self._raw_highlighter = None
+        self._controller = None
+        self._sending = False
+        self._known_vars: set = set()
 
         self._build_ui()
         self._connect_signals()
@@ -66,6 +71,12 @@ class RequestEditor(QtWidgets.QWidget):
         top.addWidget(self.send_btn)
         layout.addLayout(top)
 
+        # Предупреждение о переменных, которых нет в активном окружении.
+        self.var_warning = QtWidgets.QLabel("")
+        self.var_warning.setStyleSheet("color: #c92a2a;")
+        self.var_warning.setVisible(False)
+        layout.addWidget(self.var_warning)
+
         # Вкладки
         self.tabs = QtWidgets.QTabWidget()
         self.params_table = KeyValueTable("Параметр", "Значение")
@@ -74,6 +85,7 @@ class RequestEditor(QtWidgets.QWidget):
         self.tabs.addTab(self._build_headers_tab(), "Headers")
         self.tabs.addTab(self._build_body_tab(), "Body")
         self.tabs.addTab(self._build_auth_tab(), "Auth")
+        self.tabs.addTab(self._build_capture_tab(), "Capture")
         self.tabs.addTab(self._build_options_tab(), "Options")
         layout.addWidget(self.tabs, 1)
 
@@ -135,8 +147,8 @@ class RequestEditor(QtWidgets.QWidget):
         self.raw_edit.setFont(monospace_font())
         self.raw_edit.setPlaceholderText("Тело запроса…")
         self.body_stack.addWidget(self.raw_edit)
-        # 2: form-data
-        self.form_data_table = KeyValueTable("Поле", "Значение")
+        # 2: form-data (с выбором файла — значение вида "@путь")
+        self.form_data_table = KeyValueTable("Поле", "Значение", file_column=True)
         self.body_stack.addWidget(self.form_data_table)
         # 3: urlencoded
         self.urlencoded_table = KeyValueTable("Поле", "Значение")
@@ -191,6 +203,128 @@ class RequestEditor(QtWidgets.QWidget):
         v.addStretch(1)
         return page
 
+    def _build_capture_tab(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(page)
+        v.setContentsMargins(6, 6, 6, 6)
+
+        info = QtWidgets.QLabel(
+            "После успешного ответа значения записываются в переменные активного "
+            "окружения — так строятся цепочки: «Login» кладёт токен, остальные "
+            "запросы используют <code>{{token}}</code>."
+        )
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        add_btn = QtWidgets.QToolButton()
+        add_btn.setText("＋ Правило")
+        add_btn.clicked.connect(lambda: self._capture_insert_row(True, "", models.CAPTURE_JSON, ""))
+        row.addWidget(add_btn)
+        v.addLayout(row)
+
+        self.capture_table = QtWidgets.QTableWidget(0, 5)
+        self.capture_table.setHorizontalHeaderLabels(
+            ["", "Переменная", "Источник", "Путь / имя", ""]
+        )
+        self.capture_table.verticalHeader().setVisible(False)
+        header = self.capture_table.horizontalHeader()
+        for col, mode in (
+            (0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents),
+            (1, QtWidgets.QHeaderView.ResizeMode.Stretch),
+            (2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents),
+            (3, QtWidgets.QHeaderView.ResizeMode.Stretch),
+            (4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents),
+        ):
+            header.setSectionResizeMode(col, mode)
+        self.capture_table.itemChanged.connect(self._on_capture_changed)
+        v.addWidget(self.capture_table, 1)
+
+        hint = QtWidgets.QLabel(
+            "Примеры пути: <code>access_token</code>, <code>data.items[0].id</code>. "
+            "Для источника «header» укажите имя заголовка."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #868e96;")
+        v.addWidget(hint)
+        return page
+
+    # -- вкладка Capture ----------------------------------------------------
+    _CAPTURE_LABELS = [
+        (models.CAPTURE_JSON, "JSON"),
+        (models.CAPTURE_HEADER, "Header"),
+        (models.CAPTURE_STATUS, "Status"),
+        (models.CAPTURE_BODY, "Body"),
+    ]
+
+    def _capture_insert_row(self, enabled: bool, name: str, source: str, expr: str) -> None:
+        table = self.capture_table
+        was_loading = self._loading
+        self._loading = True
+        try:
+            row = table.rowCount()
+            table.insertRow(row)
+
+            check = QtWidgets.QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            check.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+            table.setItem(row, 0, check)
+            table.setItem(row, 1, QtWidgets.QTableWidgetItem(name))
+
+            combo = QtWidgets.QComboBox()
+            for key, title in self._CAPTURE_LABELS:
+                combo.addItem(title, key)
+            idx = combo.findData(source)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.currentIndexChanged.connect(self._on_capture_changed)
+            table.setCellWidget(row, 2, combo)
+
+            table.setItem(row, 3, QtWidgets.QTableWidgetItem(expr))
+
+            remove = QtWidgets.QToolButton()
+            remove.setText("✕")
+            remove.setAutoRaise(True)
+            remove.clicked.connect(lambda: self._capture_remove_row(remove))
+            table.setCellWidget(row, 4, remove)
+        finally:
+            self._loading = was_loading
+        if not was_loading:
+            self._on_capture_changed()
+
+    def _capture_remove_row(self, button) -> None:
+        for row in range(self.capture_table.rowCount()):
+            if self.capture_table.cellWidget(row, 4) is button:
+                self.capture_table.removeRow(row)
+                self._on_capture_changed()
+                return
+
+    def _captures_from_table(self) -> list:
+        rules = []
+        for row in range(self.capture_table.rowCount()):
+            name_item = self.capture_table.item(row, 1)
+            expr_item = self.capture_table.item(row, 3)
+            combo = self.capture_table.cellWidget(row, 2)
+            check = self.capture_table.item(row, 0)
+            name = name_item.text().strip() if name_item else ""
+            if not name:
+                continue
+            rules.append(
+                {
+                    "enabled": check.checkState() == Qt.CheckState.Checked if check else True,
+                    "name": name,
+                    "source": combo.currentData() if combo else models.CAPTURE_JSON,
+                    "expr": expr_item.text().strip() if expr_item else "",
+                }
+            )
+        return rules
+
+    def _on_capture_changed(self, *_args) -> None:
+        if self._loading or self._req is None:
+            return
+        self._req.captures = self._captures_from_table()
+        self.modified.emit()
+
     def _build_options_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(page)
@@ -218,9 +352,18 @@ class RequestEditor(QtWidgets.QWidget):
         return page
 
     # -- сигналы ------------------------------------------------------------
+    def set_controller(self, controller) -> None:
+        """Подключить контроллер (правки полей становятся отменяемыми)."""
+        self._controller = controller
+
+    def set_known_variables(self, names) -> None:
+        """Сообщить редактору имена доступных переменных (для подсветки)."""
+        self._known_vars = set(names or [])
+        self._update_var_warning()
+
     def _connect_signals(self) -> None:
-        self.send_btn.clicked.connect(self.send_requested.emit)
-        self.url_edit.returnPressed.connect(self.send_requested.emit)
+        self.send_btn.clicked.connect(self._on_send_clicked)
+        self.url_edit.returnPressed.connect(self._on_send_clicked)
 
         self.name_edit.textEdited.connect(self._on_name_edited)
         self.method_combo.currentIndexChanged.connect(self._on_changed)
@@ -269,6 +412,8 @@ class RequestEditor(QtWidgets.QWidget):
                 self.follow_check.setChecked(True)
                 self.verify_check.setChecked(True)
                 self.timeout_spin.setValue(0.0)
+                self.capture_table.setRowCount(0)
+                self.var_warning.setVisible(False)
                 return
 
             self.name_edit.setText(req.name)
@@ -295,8 +440,18 @@ class RequestEditor(QtWidgets.QWidget):
             self.follow_check.setChecked(req.follow_redirects)
             self.verify_check.setChecked(req.verify_ssl)
             self.timeout_spin.setValue(req.timeout or 0.0)
+
+            self.capture_table.setRowCount(0)
+            for rule in req.captures:
+                self._capture_insert_row(
+                    bool(rule.get("enabled", True)),
+                    str(rule.get("name", "")),
+                    rule.get("source", models.CAPTURE_JSON),
+                    str(rule.get("expr", "")),
+                )
         finally:
             self._loading = False
+        self._update_var_warning()
 
     def current_request(self) -> Optional[models.Request]:
         return self._req
@@ -350,6 +505,7 @@ class RequestEditor(QtWidgets.QWidget):
         if self._loading or self._req is None:
             return
         self._sync_to_model()
+        self._update_var_warning()
         self.modified.emit()
 
     def _on_name_edited(self, text: str) -> None:
@@ -453,6 +609,51 @@ class RequestEditor(QtWidgets.QWidget):
             self._raw_highlighter = XmlHighlighter(self.raw_edit.document())
 
     # -- состояние отправки -------------------------------------------------
+    def _on_send_clicked(self) -> None:
+        """Одна кнопка: во время отправки работает как Cancel."""
+        if self._sending:
+            self.cancel_requested.emit()
+        else:
+            self.send_requested.emit()
+
     def set_sending(self, sending: bool) -> None:
-        self.send_btn.setEnabled(not sending)
-        self.send_btn.setText("Sending…" if sending else "Send")
+        self._sending = sending
+        self.send_btn.setText("Cancel" if sending else "Send")
+        self.send_btn.setToolTip("Прервать запрос" if sending else "Отправить запрос (Ctrl+Enter)")
+
+    # -- подсветка неразрешённых переменных ---------------------------------
+    def _collect_used_variables(self) -> list:
+        """Все переменные, использованные в текущем запросе."""
+        if self._req is None:
+            return []
+        req = self._req
+        texts = [req.url, req.body_raw, req.auth_bearer_token,
+                 req.auth_basic_username, req.auth_basic_password]
+        for collection in (req.headers, req.params, req.body_form):
+            for item in collection:
+                if item.get("enabled", True):
+                    texts.append(str(item.get("key", "")))
+                    texts.append(str(item.get("value", "")))
+        found = []
+        for text in texts:
+            for name in find_variables(text):
+                if name not in found:
+                    found.append(name)
+        return found
+
+    def _update_var_warning(self) -> None:
+        """Показать переменные, которых нет в активном окружении."""
+        if self._req is None:
+            self.var_warning.setVisible(False)
+            return
+        unresolved = [n for n in self._collect_used_variables() if n not in self._known_vars]
+        if unresolved:
+            names = ", ".join("{{" + n + "}}" for n in unresolved[:6])
+            more = "…" if len(unresolved) > 6 else ""
+            self.var_warning.setText(f"⚠ Не заданы переменные: {names}{more}")
+            self.var_warning.setToolTip(
+                "Задайте их в «Файл → Окружения и переменные…» — иначе они уйдут в запрос как есть."
+            )
+            self.var_warning.setVisible(True)
+        else:
+            self.var_warning.setVisible(False)
