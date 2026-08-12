@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from . import http_client
+from . import http_client, oauth
 from .qtcompat import QtCore, Signal
 
 
@@ -33,6 +33,7 @@ class RequestRunner(QtCore.QThread):
         kwargs: Dict[str, Any],
         timeout: float = http_client.DEFAULT_TIMEOUT,
         session: Optional[requests.Session] = None,
+        oauth_config: Optional[Dict[str, str]] = None,
         parent: QtCore.QObject = None,
     ):
         super().__init__(parent)
@@ -41,6 +42,9 @@ class RequestRunner(QtCore.QThread):
         self._kwargs = kwargs
         self._timeout = timeout
         self._session = session
+        # Параметры OAuth2 client credentials: токен запрашивается в этом же
+        # потоке перед основным запросом, чтобы интерфейс не блокировался.
+        self._oauth_config = oauth_config
         self._cancelled = False
 
     # -- отмена -------------------------------------------------------------
@@ -58,6 +62,15 @@ class RequestRunner(QtCore.QThread):
     # -- выполнение ---------------------------------------------------------
     def run(self) -> None:  # noqa: D401 - вызывается Qt в отдельном потоке
         try:
+            if self._oauth_config:
+                token = oauth.fetch_token(
+                    self._oauth_config, session=self._session, timeout=self._timeout
+                )
+                if self._cancelled:
+                    self.cancelled.emit()
+                    return
+                http_client.apply_oauth_token(self._kwargs, token)
+
             data = http_client.perform_prepared(
                 self._method,
                 self._url,
@@ -72,6 +85,8 @@ class RequestRunner(QtCore.QThread):
             self.succeeded.emit(data)
         except http_client.Cancelled:
             self.cancelled.emit()
+        except oauth.TokenError as exc:
+            self._fail(f"OAuth2: {exc}")
         except requests.exceptions.Timeout:
             self._fail(f"Превышено время ожидания ответа ({self._timeout} с)")
         except requests.exceptions.SSLError as exc:

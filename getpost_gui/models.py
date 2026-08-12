@@ -21,7 +21,8 @@ BODY_NONE = "none"
 BODY_RAW = "raw"
 BODY_FORM_DATA = "form-data"
 BODY_URLENCODED = "x-www-form-urlencoded"
-BODY_TYPES = [BODY_NONE, BODY_RAW, BODY_FORM_DATA, BODY_URLENCODED]
+BODY_GRAPHQL = "graphql"
+BODY_TYPES = [BODY_NONE, BODY_RAW, BODY_FORM_DATA, BODY_URLENCODED, BODY_GRAPHQL]
 
 # --- Язык "сырого" тела (для подсветки и Content-Type) ---------------------
 RAW_TEXT = "text"
@@ -33,7 +34,85 @@ RAW_LANGS = [RAW_JSON, RAW_TEXT, RAW_XML]
 AUTH_NONE = "none"
 AUTH_BASIC = "basic"
 AUTH_BEARER = "bearer"
-AUTH_TYPES = [AUTH_NONE, AUTH_BASIC, AUTH_BEARER]
+AUTH_API_KEY = "apikey"
+AUTH_OAUTH2_CC = "oauth2_cc"   # client credentials (без браузерного флоу)
+# «Наследовать от папки» — значение по умолчанию для новых запросов.
+AUTH_INHERIT = "inherit"
+AUTH_TYPES = [AUTH_NONE, AUTH_INHERIT, AUTH_BASIC, AUTH_BEARER, AUTH_API_KEY, AUTH_OAUTH2_CC]
+
+# Куда подставлять API-ключ.
+APIKEY_IN_HEADER = "header"
+APIKEY_IN_QUERY = "query"
+APIKEY_LOCATIONS = [APIKEY_IN_HEADER, APIKEY_IN_QUERY]
+
+# Как передавать client_id/secret при получении токена OAuth2.
+OAUTH_SEND_BODY = "body"
+OAUTH_SEND_BASIC = "basic"
+OAUTH_SEND_MODES = [OAUTH_SEND_BODY, OAUTH_SEND_BASIC]
+
+# Поля авторизации — общие для запроса и папки (папка может задать авторизацию
+# для всех вложенных запросов).
+AUTH_FIELDS = (
+    "auth_type",
+    "auth_basic_username",
+    "auth_basic_password",
+    "auth_bearer_token",
+    "auth_api_key_name",
+    "auth_api_key_value",
+    "auth_api_key_location",
+    "auth_oauth2_token_url",
+    "auth_oauth2_client_id",
+    "auth_oauth2_client_secret",
+    "auth_oauth2_scope",
+    "auth_oauth2_send_as",
+)
+
+
+def init_auth(obj, auth_type: str = AUTH_NONE) -> None:
+    """Задать полям авторизации значения по умолчанию."""
+    obj.auth_type = auth_type
+    obj.auth_basic_username = ""
+    obj.auth_basic_password = ""
+    obj.auth_bearer_token = ""
+    obj.auth_api_key_name = ""
+    obj.auth_api_key_value = ""
+    obj.auth_api_key_location = APIKEY_IN_HEADER
+    obj.auth_oauth2_token_url = ""
+    obj.auth_oauth2_client_id = ""
+    obj.auth_oauth2_client_secret = ""
+    obj.auth_oauth2_scope = ""
+    obj.auth_oauth2_send_as = OAUTH_SEND_BODY
+
+
+def auth_to_dict(obj) -> Dict[str, Any]:
+    """Сериализовать поля авторизации объекта."""
+    return {name: getattr(obj, name) for name in AUTH_FIELDS}
+
+
+def auth_from_dict(obj, d: Dict[str, Any], default_type: str = AUTH_NONE) -> None:
+    """Прочитать поля авторизации из словаря."""
+    init_auth(obj, default_type)
+    obj.auth_type = _coerce_choice(d.get("auth_type"), AUTH_TYPES, default_type)
+    obj.auth_basic_username = str(d.get("auth_basic_username", ""))
+    obj.auth_basic_password = str(d.get("auth_basic_password", ""))
+    obj.auth_bearer_token = str(d.get("auth_bearer_token", ""))
+    obj.auth_api_key_name = str(d.get("auth_api_key_name", ""))
+    obj.auth_api_key_value = str(d.get("auth_api_key_value", ""))
+    obj.auth_api_key_location = _coerce_choice(
+        d.get("auth_api_key_location"), APIKEY_LOCATIONS, APIKEY_IN_HEADER
+    )
+    obj.auth_oauth2_token_url = str(d.get("auth_oauth2_token_url", ""))
+    obj.auth_oauth2_client_id = str(d.get("auth_oauth2_client_id", ""))
+    obj.auth_oauth2_client_secret = str(d.get("auth_oauth2_client_secret", ""))
+    obj.auth_oauth2_scope = str(d.get("auth_oauth2_scope", ""))
+    obj.auth_oauth2_send_as = _coerce_choice(
+        d.get("auth_oauth2_send_as"), OAUTH_SEND_MODES, OAUTH_SEND_BODY
+    )
+
+
+def defines_auth(obj) -> bool:
+    """Задаёт ли объект собственную авторизацию (а не «нет»/«наследовать»)."""
+    return getattr(obj, "auth_type", AUTH_NONE) not in (AUTH_NONE, AUTH_INHERIT)
 
 # Максимальная глубина вложенности папок (Workspace → 1 → 2).
 MAX_FOLDER_DEPTH = 2
@@ -122,11 +201,11 @@ class Request:
         self.body_raw_lang: str = RAW_JSON
         # Используется и для form-data, и для x-www-form-urlencoded
         self.body_form: List[Dict[str, Any]] = []
-        # Авторизация
-        self.auth_type: str = AUTH_NONE
-        self.auth_basic_username: str = ""
-        self.auth_basic_password: str = ""
-        self.auth_bearer_token: str = ""
+        # GraphQL: запрос и переменные (JSON-текст)
+        self.body_graphql_query: str = ""
+        self.body_graphql_variables: str = ""
+        # Авторизация (набор полей общий с папкой)
+        init_auth(self, AUTH_NONE)
         # Параметры выполнения (per-request). timeout=None → глобальный.
         self.follow_redirects: bool = True
         self.verify_ssl: bool = True
@@ -137,7 +216,7 @@ class Request:
 
     # -- сериализация -------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "id": self.id,
             "name": self.name,
             "method": self.method,
@@ -148,15 +227,15 @@ class Request:
             "body_raw": self.body_raw,
             "body_raw_lang": self.body_raw_lang,
             "body_form": _copy_kv_list(self.body_form),
-            "auth_type": self.auth_type,
-            "auth_basic_username": self.auth_basic_username,
-            "auth_basic_password": self.auth_basic_password,
-            "auth_bearer_token": self.auth_bearer_token,
+            "body_graphql_query": self.body_graphql_query,
+            "body_graphql_variables": self.body_graphql_variables,
             "follow_redirects": self.follow_redirects,
             "verify_ssl": self.verify_ssl,
             "timeout": self.timeout,
             "captures": _copy_kv_list(self.captures),
         }
+        data.update(auth_to_dict(self))
+        return data
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Request":
@@ -169,10 +248,11 @@ class Request:
         r.body_raw = str(d.get("body_raw", ""))
         r.body_raw_lang = _coerce_choice(d.get("body_raw_lang"), RAW_LANGS, RAW_JSON)
         r.body_form = normalize_kv_list(d.get("body_form"))
-        r.auth_type = _coerce_choice(d.get("auth_type"), AUTH_TYPES, AUTH_NONE)
-        r.auth_basic_username = str(d.get("auth_basic_username", ""))
-        r.auth_basic_password = str(d.get("auth_basic_password", ""))
-        r.auth_bearer_token = str(d.get("auth_bearer_token", ""))
+        r.body_graphql_query = str(d.get("body_graphql_query", ""))
+        r.body_graphql_variables = str(d.get("body_graphql_variables", ""))
+        # Для старых файлов значение по умолчанию — «нет авторизации»,
+        # поэтому поведение сохранённых запросов не меняется.
+        auth_from_dict(r, d, default_type=AUTH_NONE)
         r.follow_redirects = bool(d.get("follow_redirects", True))
         r.verify_ssl = bool(d.get("verify_ssl", True))
         timeout = d.get("timeout")
@@ -189,28 +269,48 @@ class Request:
 
 
 class Folder:
-    """Папка: содержит вложенные папки и запросы."""
+    """Папка: содержит вложенные папки и запросы.
+
+    Папка может задавать общие настройки для всего своего содержимого:
+    базовый URL, заголовки и авторизацию. Запросы применяют их, если сами
+    ничего не переопределяют (см. :mod:`getpost_gui.inheritance`).
+    """
 
     def __init__(self, name: str = "New Folder", id: Optional[str] = None):
         self.id: str = id or new_id()
         self.name: str = name
+        # Общие настройки для вложенных запросов.
+        self.base_url: str = ""
+        self.headers: List[Dict[str, Any]] = []
+        init_auth(self, AUTH_NONE)
         self.folders: List["Folder"] = []
         self.requests: List[Request] = []
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "id": self.id,
             "name": self.name,
+            "base_url": self.base_url,
+            "headers": _copy_kv_list(self.headers),
             "folders": [f.to_dict() for f in self.folders],
             "requests": [r.to_dict() for r in self.requests],
         }
+        data.update(auth_to_dict(self))
+        return data
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Folder":
         f = cls(name=str(d.get("name", "New Folder")), id=d.get("id"))
+        f.base_url = str(d.get("base_url", ""))
+        f.headers = normalize_kv_list(d.get("headers"))
+        auth_from_dict(f, d, default_type=AUTH_NONE)
         f.folders = [Folder.from_dict(x) for x in d.get("folders", []) if isinstance(x, dict)]
         f.requests = [Request.from_dict(x) for x in d.get("requests", []) if isinstance(x, dict)]
         return f
+
+    def has_settings(self) -> bool:
+        """Заданы ли у папки общие настройки (для пометки в дереве)."""
+        return bool(self.base_url) or bool(self.headers) or defines_auth(self)
 
     def clone(self, new_name: Optional[str] = None) -> "Folder":
         """Создать глубокую копию папки с новыми идентификаторами."""

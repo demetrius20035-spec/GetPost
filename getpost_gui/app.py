@@ -4,9 +4,10 @@ from __future__ import annotations
 import sys
 from typing import List, Optional
 
-from .qtcompat import QtWidgets
-from .views.main_window import MainWindow
 from . import theme
+from .qtcompat import QtWidgets
+from .storage import Storage
+from .views.main_window import MainWindow
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -15,9 +16,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     app.setApplicationName("GetPost")
     app.setOrganizationName("GetPost")
     app.setApplicationDisplayName("GetPost")
-    theme.apply(app)
 
-    window = MainWindow()
+    # Тема выбирается в настройках и запоминается между запусками.
+    storage = Storage()
+    theme.apply(app, storage.load_settings().get("theme", theme.THEME_LIGHT))
+
+    window = MainWindow(storage=storage)
     window.show()
     return app.exec()
 

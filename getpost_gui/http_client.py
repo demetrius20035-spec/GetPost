@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import mimetypes
 import os
 import time
@@ -104,6 +105,38 @@ def is_file_value(value: str) -> bool:
     return isinstance(value, str) and value.startswith(FILE_PREFIX) and len(value) > 1
 
 
+def build_graphql_body(req: models.Request, variables: Optional[Dict[str, str]] = None) -> bytes:
+    """Собрать тело GraphQL-запроса: ``{"query": ..., "variables": {...}}``.
+
+    Переменные GraphQL задаются JSON-текстом; если он некорректен, отправляем
+    его как есть внутри поля ``variables`` — сервер сообщит об ошибке понятнее,
+    чем молчаливое отбрасывание.
+    """
+    variables = variables or {}
+    query = substitute(req.body_graphql_query, variables)
+    payload: Dict[str, Any] = {"query": query}
+
+    raw_vars = substitute(req.body_graphql_variables, variables).strip()
+    if raw_vars:
+        try:
+            payload["variables"] = json.loads(raw_vars)
+        except (ValueError, TypeError):
+            payload["variables"] = raw_vars
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def apply_oauth_token(kwargs: Dict[str, Any], token: str) -> None:
+    """Добавить полученный OAuth2-токен в заголовки подготовленного запроса."""
+    headers = kwargs.setdefault("headers", {})
+    if not any(k.lower() == "authorization" for k in headers):
+        headers["Authorization"] = f"Bearer {token}"
+
+
+def needs_oauth(req: models.Request) -> bool:
+    """Требуется ли запросу получение OAuth2-токена перед отправкой."""
+    return req.auth_type == models.AUTH_OAUTH2_CC
+
+
 def build_multipart(pairs: List[Tuple[str, str]]) -> List[Tuple[str, Tuple]]:
     """Собрать ``files`` для multipart/form-data.
 
@@ -151,6 +184,18 @@ def build_request_kwargs(
         token = substitute(req.auth_bearer_token, variables)
         if not _has_header(headers, "authorization"):
             headers.append(("Authorization", f"Bearer {token}"))
+    elif req.auth_type == models.AUTH_API_KEY:
+        name = substitute(req.auth_api_key_name, variables).strip()
+        value = substitute(req.auth_api_key_value, variables)
+        if name:
+            if req.auth_api_key_location == models.APIKEY_IN_QUERY:
+                params.append((name, value))
+            elif not _has_header(headers, name):
+                headers.append((name, value))
+    elif req.auth_type == models.AUTH_OAUTH2_CC:
+        # Сам токен добавляется перед отправкой (нужен сетевой запрос),
+        # см. oauth.fetch_token и apply_oauth_token.
+        pass
 
     # --- тело запроса ---
     if req.body_type == models.BODY_RAW:
@@ -173,6 +218,10 @@ def build_request_kwargs(
         pairs = _enabled_pairs(req.body_form, variables)
         if pairs:
             kwargs["files"] = build_multipart(pairs)
+    elif req.body_type == models.BODY_GRAPHQL:
+        kwargs["data"] = build_graphql_body(req, variables)
+        if not _has_header(headers, "content-type"):
+            headers.append(("Content-Type", "application/json; charset=utf-8"))
 
     # requests ожидает dict для заголовков (CaseInsensitiveDict).
     if headers:

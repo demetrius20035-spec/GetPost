@@ -10,8 +10,14 @@
   send    отправить произвольный HTTP-запрос
   run     отправить запрос, сохранённый в Workspace (через GUI)
   ls      показать рабочие пространства или их содержимое
+  export  выгрузить Workspace/папку/запрос в файл обмена
+  import  загрузить файл обмена
+  code    сгенерировать код запроса (curl/python/javascript/httpie)
 
 Форму ``getpost.py <METHOD> <URL>`` тоже понимает (как ``send``).
+
+``run`` и ``code`` учитывают настройки папок (базовый URL, общие заголовки,
+авторизация) и правила извлечения переменных из ответа.
 
 Примеры
 -------
@@ -48,10 +54,19 @@ import requests
 
 # Подключаем общее ядро из соседнего пакета (без зависимости от Qt).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from getpost_gui import capture, codegen, http_client, models, share, storage  # noqa: E402
+from getpost_gui import (  # noqa: E402
+    capture,
+    codegen,
+    http_client,
+    inheritance,
+    models,
+    oauth,
+    share,
+    storage,
+)
 from getpost_gui.variables import substitute  # noqa: E402
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 SUBCOMMANDS = {"send", "run", "ls", "list", "export", "import", "code"}
@@ -252,22 +267,38 @@ def apply_captures_cli(req, resp, ws, args) -> None:
 
 def send_request(req: models.Request, variables: dict, args, multipart_items=None,
                  workspace=None) -> int:
-    method, url, kwargs = http_client.build_request_kwargs(req, variables)
+    # Настройки папок (базовый URL, общие заголовки, авторизация).
+    effective = req
+    if workspace is not None:
+        effective, _chain = inheritance.resolve_in(workspace, req, variables)
+
+    method, url, kwargs = http_client.build_request_kwargs(effective, variables)
     if not url:
         info(_c("Ошибка: пустой URL", Ansi.RED))
         return EXIT_ERROR
+
+    # OAuth2 client credentials: получаем токен перед основным запросом.
+    if http_client.needs_oauth(effective):
+        try:
+            token = oauth.fetch_token(
+                oauth.config_from(effective, variables), timeout=args.timeout
+            )
+        except oauth.TokenError as exc:
+            info(_c(f"OAuth2: {exc}", Ansi.RED))
+            return EXIT_REQUEST
+        http_client.apply_oauth_token(kwargs, token)
 
     if multipart_items:
         kwargs["files"] = build_multipart_files(multipart_items, variables)
         kwargs.pop("data", None)
 
     # Учитываем сохранённые в запросе опции; флаги CLI могут их ужесточить.
-    kwargs["allow_redirects"] = req.follow_redirects and not args.no_redirect
-    kwargs["verify"] = req.verify_ssl and not args.insecure
+    kwargs["allow_redirects"] = effective.follow_redirects and not args.no_redirect
+    kwargs["verify"] = effective.verify_ssl and not args.insecure
     if args.proxy:
         kwargs["proxies"] = {"http": args.proxy, "https": args.proxy}
     # Тайм-аут: приоритет у сохранённого в запросе значения.
-    timeout = req.timeout if req.timeout else args.timeout
+    timeout = effective.timeout if effective.timeout else args.timeout
 
     if args.insecure:
         try:
@@ -511,8 +542,10 @@ def cmd_code(args) -> int:
         return EXIT_ERROR
     if args.env:
         ws.set_active_env(args.env)
+    # Генерируем код для итогового запроса — с настройками папок.
+    effective, _chain = inheritance.resolve_in(ws, matches[0][1], ws.variables)
     try:
-        code = codegen.generate(args.lang, matches[0][1], ws.variables)
+        code = codegen.generate(args.lang, effective, ws.variables)
     except ValueError as exc:
         info(_c(str(exc), Ansi.RED))
         return EXIT_ERROR

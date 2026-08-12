@@ -78,9 +78,33 @@ class KeyValueTable(QtWidgets.QWidget):
             )
             header.setSectionResizeMode(col, mode)
 
+        # Массовое редактирование: те же данные текстом, построчно «Ключ: Значение».
+        self.bulk_edit = QtWidgets.QPlainTextEdit()
+        self.bulk_edit.setFont(monospace_font())
+        self.bulk_edit.setPlaceholderText(
+            "По одной паре в строке:\nContent-Type: application/json\n"
+            "# строка с решёткой — выключенная пара"
+        )
+        self.bulk_edit.setVisible(False)
+
+        self.bulk_toggle = QtWidgets.QToolButton()
+        self.bulk_toggle.setText("Текстом")
+        self.bulk_toggle.setCheckable(True)
+        self.bulk_toggle.setToolTip(
+            "Массовое редактирование: вставить или скопировать сразу все пары"
+        )
+        self.bulk_toggle.toggled.connect(self._toggle_bulk)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.bulk_toggle)
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(toolbar)
         layout.addWidget(self.table)
+        layout.addWidget(self.bulk_edit)
 
         self.table.itemChanged.connect(self._on_item_changed)
         self._append_blank_row()
@@ -187,6 +211,63 @@ class KeyValueTable(QtWidgets.QWidget):
         finally:
             self._mutating = False
         self.changed.emit()
+
+    # -- массовое редактирование текстом ------------------------------------
+    def _items_to_text(self) -> str:
+        lines = []
+        for item in self.get_items():
+            prefix = "" if item.get("enabled", True) else "# "
+            lines.append(f"{prefix}{item.get('key', '')}: {item.get('value', '')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _text_to_items(text: str) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            enabled = True
+            if stripped.startswith("#"):
+                enabled = False
+                stripped = stripped[1:].strip()
+                if not stripped:
+                    continue
+            # Разделителем считается первый «:» или «=» — что встретилось раньше.
+            colon, equals = stripped.find(":"), stripped.find("=")
+            candidates = [pos for pos in (colon, equals) if pos > 0]
+            if candidates:
+                pos = min(candidates)
+                key, value = stripped[:pos], stripped[pos + 1:]
+            else:
+                key, value = stripped, ""
+            items.append({"enabled": enabled, "key": key.strip(), "value": value.strip()})
+        return items
+
+    def _toggle_bulk(self, enabled: bool) -> None:
+        """Переключиться между таблицей и текстовым режимом, сохранив данные."""
+        if enabled:
+            self.bulk_edit.setPlainText(self._items_to_text())
+            self.table.setVisible(False)
+            self.bulk_edit.setVisible(True)
+        else:
+            parsed = self._text_to_items(self.bulk_edit.toPlainText())
+            secrets = {i.get("key"): i.get("secret", False) for i in self.get_items()}
+            if self._col_secret >= 0:
+                for item in parsed:
+                    item["secret"] = secrets.get(item["key"], False)
+            self.set_items(parsed)
+            self.bulk_edit.setVisible(False)
+            self.table.setVisible(True)
+            self.changed.emit()
+
+    def is_bulk_mode(self) -> bool:
+        return self.bulk_toggle.isChecked()
+
+    def commit_bulk(self) -> None:
+        """Применить текстовый режим, если он включён (перед чтением данных)."""
+        if self.bulk_toggle.isChecked():
+            self.bulk_toggle.setChecked(False)
 
     # -- секреты и маскирование ---------------------------------------------
     def _is_secret_row(self, row: int) -> bool:

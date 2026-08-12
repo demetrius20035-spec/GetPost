@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple, Union
 
 from .. import models, share
 from ..qtcompat import Qt, QtGui, QtWidgets, Signal
+from .dialogs import FolderSettingsDialog
 
 ROLE_OBJ = Qt.ItemDataRole.UserRole
 
@@ -97,6 +98,7 @@ class Sidebar(QtWidgets.QWidget):
     item_renamed = Signal(object)            # переименован объект (Folder/Request)
     copy_curl_requested = Signal(object)     # «Copy as cURL» для запроса
     export_requested = Signal(object)        # экспорт папки/запроса в файл
+    folder_settings_changed = Signal(object)  # изменены общие настройки папки
     environment_switched = Signal(str)       # выбрано другое окружение
     workspace_switched = Signal(str)         # выбран другой Workspace (по id)
     new_workspace_requested = Signal()
@@ -258,7 +260,9 @@ class Sidebar(QtWidgets.QWidget):
             self._building = False
 
     def _new_item(self, parent_item, obj, icon_text: str) -> QtWidgets.QTreeWidgetItem:
-        item = QtWidgets.QTreeWidgetItem([f"{icon_text} {obj.name}"])
+        # Подпись строится одним методом, чтобы пометка настроек папки
+        # появлялась и при построении дерева, и при переименовании.
+        item = QtWidgets.QTreeWidgetItem([self._label_for(obj)])
         item.setData(0, ROLE_OBJ, obj)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
         if parent_item is None:
@@ -280,8 +284,11 @@ class Sidebar(QtWidgets.QWidget):
 
     @staticmethod
     def _label_for(obj) -> str:
-        icon = "📁" if isinstance(obj, models.Folder) else "•"
-        return f"{icon} {obj.name}"
+        if isinstance(obj, models.Folder):
+            # Звёздочка означает, что у папки есть общие настройки.
+            mark = " ⚙" if obj.has_settings() else ""
+            return f"📁 {obj.name}{mark}"
+        return f"• {obj.name}"
 
     # -- helpers для текущего выделения ------------------------------------
     @staticmethod
@@ -347,6 +354,9 @@ class Sidebar(QtWidgets.QWidget):
         container, parent_item = self._target_for_new()
         req = models.Request(name="Новый запрос")
         req.headers = models.default_new_headers()
+        # Новые запросы по умолчанию берут авторизацию из папки (как в Postman);
+        # у сохранённых ранее запросов поведение не меняется.
+        req.auth_type = models.AUTH_INHERIT
         with self._txn("Создание запроса"):
             container.requests.append(req)
         new_item = self._add_request_item(parent_item, req)
@@ -366,12 +376,15 @@ class Sidebar(QtWidgets.QWidget):
         obj = self._obj_of(item)
         if obj is None:
             return
-        # Текст в дереве содержит иконку — извлекаем имя.
+        # Текст в дереве содержит иконку и, возможно, пометку настроек —
+        # извлекаем из подписи только имя.
         text = item.text(0)
         for prefix in ("📁 ", "• "):
             if text.startswith(prefix):
                 text = text[len(prefix):]
                 break
+        if text.endswith(" ⚙"):
+            text = text[: -len(" ⚙")]
         new_name = text.strip()
         if not new_name:
             new_name = obj.name  # пустое имя не допускаем
@@ -428,6 +441,8 @@ class Sidebar(QtWidgets.QWidget):
         menu.addAction("Новая папка", self.add_folder)
         if obj is not None:
             menu.addSeparator()
+            if isinstance(obj, models.Folder):
+                menu.addAction("Настройки папки…", lambda: self._edit_folder(obj))
             menu.addAction("Дублировать", lambda: self._duplicate_item(item))
             menu.addAction("Переместить в…", lambda: self._move_to(item))
             menu.addAction("Копировать в…", lambda: self._copy_to(item))
@@ -555,6 +570,32 @@ class Sidebar(QtWidgets.QWidget):
     def select_request(self, req) -> None:
         """Выбрать в дереве указанный запрос (быстрый переход, отмена)."""
         self._select_obj(req)
+
+    # -- настройки папки ----------------------------------------------------
+    def _edit_folder(self, folder: models.Folder) -> None:
+        """Диалог общих настроек папки (базовый URL, заголовки, авторизация)."""
+        dialog = FolderSettingsDialog(folder, self)
+        if dialog.exec():
+            with self._txn(f"Настройки папки: {folder.name}"):
+                dialog.apply_to(folder)
+            self.update_item_name(folder)
+            self.folder_settings_changed.emit(folder)
+            self.structure_changed.emit()
+
+    def edit_folder_settings(self) -> None:
+        """Открыть настройки выбранной папки (или папки текущего запроса)."""
+        item = self.tree.currentItem()
+        obj = self._obj_of(item)
+        if isinstance(obj, models.Folder):
+            self._edit_folder(obj)
+            return
+        container = self._container_of_item(item)
+        if isinstance(container, models.Folder):
+            self._edit_folder(container)
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Настройки папки", "Выберите папку в дереве."
+        )
 
     def _select_obj(self, obj) -> None:
         it = QtWidgets.QTreeWidgetItemIterator(self.tree)

@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
+from .. import theme
 from ..highlighter import JsonHighlighter, XmlHighlighter, guess_language
 from ..http_client import ResponseData
 from ..qtcompat import Qt, QtGui, QtWidgets
+from .dialogs import DiffDialog
 from .widgets import monospace_font
 
 _HISTORY_LIMIT = 15
@@ -66,8 +68,13 @@ class ResponseView(QtWidgets.QWidget):
         self.history_combo = QtWidgets.QComboBox()
         self.history_combo.setMinimumWidth(200)
         self.history_combo.currentIndexChanged.connect(self._on_history_selected)
+        self.diff_btn = QtWidgets.QToolButton()
+        self.diff_btn.setText("Сравнить…")
+        self.diff_btn.setToolTip("Сравнить выбранный ответ с предыдущим")
+        self.diff_btn.clicked.connect(self._show_diff)
         hist_row.addWidget(self.history_label)
         hist_row.addWidget(self.history_combo, 1)
+        hist_row.addWidget(self.diff_btn)
         layout.addLayout(hist_row)
 
         # Сообщения о проблемах извлечения переменных (вкладка Capture).
@@ -293,6 +300,7 @@ class ResponseView(QtWidgets.QWidget):
             has_many = len(self._history) > 1
             self.history_label.setVisible(has_many)
             self.history_combo.setVisible(has_many)
+            self.diff_btn.setVisible(has_many)
             if select_last and self._history:
                 self.history_combo.setCurrentIndex(len(self._history) - 1)
         finally:
@@ -306,13 +314,15 @@ class ResponseView(QtWidgets.QWidget):
     # -- отрисовка ----------------------------------------------------------
     def _render_data(self, data: ResponseData) -> None:
         self._current = data
-        color = "#2b8a3e" if data.ok else "#c92a2a"
+        palette = theme.syntax()
         if data.status_code >= 500:
-            color = "#c92a2a"
+            color = palette["server_error"]
         elif data.status_code >= 400:
-            color = "#e8590c"
+            color = palette["client_error"]
         elif data.status_code >= 300:
-            color = "#1864ab"
+            color = palette["redirect"]
+        else:
+            color = palette["ok"] if data.ok else palette["server_error"]
         self.status_label.setText(data.status_line)
         self.status_label.setStyleSheet(f"font-weight: bold; color: {color};")
         self.time_label.setText(f"Время: {data.elapsed_ms:.0f} мс")
@@ -374,6 +384,24 @@ class ResponseView(QtWidgets.QWidget):
             return
         self.preview_stack.setCurrentIndex(2)
 
+    def _show_diff(self) -> None:
+        """Сравнить выбранный ответ с предыдущим из истории."""
+        index = self.history_combo.currentIndex()
+        if index <= 0 or index >= len(self._history):
+            QtWidgets.QMessageBox.information(
+                self, "Сравнение", "Нужны минимум два ответа: выберите не первый в истории."
+            )
+            return
+        older, newer = self._history[index - 1], self._history[index]
+        if not older.text and not older.content:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Сравнение",
+                "У более старого ответа тело уже выгружено из памяти — "
+                "сравнить можно только статус и заголовки.",
+            )
+        DiffDialog(older, newer, index, self).exec()
+
     # -- действия -----------------------------------------------------------
     def _toggle_wrap(self, wrap: bool) -> None:
         mode = (
@@ -417,6 +445,12 @@ class ResponseView(QtWidgets.QWidget):
             return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
         except (ValueError, TypeError):
             return text
+
+    def refresh_highlighting(self) -> None:
+        """Пересоздать подсветку и перекрасить статус после смены темы."""
+        self._set_highlighter(self._language)
+        if self._current is not None:
+            self._render_data(self._current)
 
     def _set_highlighter(self, language: str) -> None:
         if self._highlighter is not None:

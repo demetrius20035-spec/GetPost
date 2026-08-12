@@ -144,6 +144,25 @@ class Storage:
         text = json.dumps(settings, ensure_ascii=False, indent=2)
         self._atomic_write(self.settings_file, text)
 
+    # -- cookies ------------------------------------------------------------
+    @property
+    def cookies_file(self) -> Path:
+        return self.base_dir / "cookies.json"
+
+    def load_cookies(self) -> List[Dict[str, str]]:
+        """Прочитать сохранённые cookies (список словарей)."""
+        try:
+            with open(self.cookies_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+        except (OSError, ValueError, json.JSONDecodeError):
+            return []
+
+    def save_cookies(self, cookies: List[Dict[str, str]]) -> None:
+        self._atomic_write(
+            self.cookies_file, json.dumps(cookies, ensure_ascii=False, indent=2)
+        )
+
     # -- сброс --------------------------------------------------------------
     def reset(self) -> None:
         """Удалить все Workspaces и настройки (сброс к значениям по умолчанию)."""
@@ -152,11 +171,12 @@ class Storage:
                 path.unlink()
             except OSError:
                 pass
-        if self.settings_file.exists():
-            try:
-                self.settings_file.unlink()
-            except OSError:
-                pass
+        for path in (self.settings_file, self.cookies_file):
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
         self.ensure_dirs()
 
 

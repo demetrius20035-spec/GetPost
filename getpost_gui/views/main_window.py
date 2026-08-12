@@ -11,12 +11,29 @@ from typing import List, Optional
 
 import requests
 
-from .. import capture, codegen, http_client, models, share
+from .. import (
+    capture,
+    codegen,
+    cookies,
+    http_client,
+    inheritance,
+    models,
+    oauth,
+    share,
+    theme,
+)
 from ..controller import WorkspaceController
 from ..qtcompat import QtCore, QtGui, QtWidgets
 from ..runner import RequestRunner
 from ..storage import Storage, build_default_workspace
-from .dialogs import CodeExportDialog, EnvironmentsDialog, ImportCurlDialog, QuickOpenDialog
+from .dialogs import (
+    CodeExportDialog,
+    CookiesDialog,
+    EnvironmentsDialog,
+    ImportCurlDialog,
+    QuickOpenDialog,
+    SettingsDialog,
+)
 from .request_editor import RequestEditor
 from .response_view import ResponseView
 from .sidebar import Sidebar
@@ -49,6 +66,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.controller = WorkspaceController(self)
         # Одна сессия на приложение: keep-alive соединений и общие cookies.
         self.session = requests.Session()
+        if self.settings.get("persist_cookies", True):
+            cookies.import_jar(self.session, self.storage.load_cookies())
+        self._apply_proxy()
 
         self.setWindowTitle("GetPost — HTTP-клиент")
         self.resize(1200, 720)
@@ -107,6 +127,10 @@ class MainWindow(QtWidgets.QMainWindow):
         import_action.setStatusTip("Импортировать Workspace, папку или запрос из файла")
         file_menu.addAction("Экспорт текущего Workspace…", self._export_workspace)
         file_menu.addSeparator()
+        settings_action = file_menu.addAction("Настройки…", self.edit_settings)
+        settings_action.setShortcut("Ctrl+,")
+        file_menu.addAction("Cookies…", self.edit_cookies)
+        file_menu.addSeparator()
         reset_action = file_menu.addAction("Сбросить конфигурацию…", self.reset_config)
         reset_action.setStatusTip("Удалить все рабочие пространства и настройки")
         file_menu.addSeparator()
@@ -135,6 +159,8 @@ class MainWindow(QtWidgets.QMainWindow):
         new_req_action.setShortcut("Ctrl+N")
         new_folder_action = req_menu.addAction("Новая папка", self.sidebar.add_folder)
         new_folder_action.setShortcut("Ctrl+Shift+N")
+        folder_action = req_menu.addAction("Настройки папки…", self.sidebar.edit_folder_settings)
+        folder_action.setStatusTip("Базовый URL, общие заголовки и авторизация для папки")
         dup_action = req_menu.addAction("Дублировать", self.sidebar.duplicate_current)
         dup_action.setShortcut("Ctrl+D")
         req_menu.addSeparator()
@@ -153,6 +179,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.item_renamed.connect(self._on_item_renamed)
         self.sidebar.copy_curl_requested.connect(self._on_copy_curl)
         self.sidebar.export_requested.connect(self._export_object)
+        self.sidebar.folder_settings_changed.connect(self._on_folder_settings_changed)
         self.sidebar.export_workspace_requested.connect(self._export_workspace)
         self.sidebar.import_requested.connect(self._import_item)
         self.sidebar.environment_switched.connect(self._on_env_switched)
@@ -415,6 +442,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_current_workspace(ws, select_first=True)
         self.status.showMessage(f"Импортировано рабочее пространство «{ws.name}»", 5000)
 
+    # -- глобальные настройки ------------------------------------------------
+    def edit_settings(self) -> None:
+        dialog = SettingsDialog(self.settings, self)
+        if not dialog.exec():
+            return
+        values = dialog.values()
+        theme_changed = values["theme"] != self.settings.get("theme", theme.THEME_LIGHT)
+        self.settings.update(values)
+        self.timeout = float(values["timeout"])
+        self._apply_proxy()
+        try:
+            self.storage.save_settings(self.settings)
+        except OSError as exc:
+            self.status.showMessage(f"Настройки не сохранены: {exc}", 8000)
+        if theme_changed:
+            self._apply_theme()
+        self.status.showMessage("Настройки сохранены", 3000)
+
+    def _apply_theme(self) -> None:
+        """Применить выбранную тему и перерисовать подсветку."""
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        theme.apply(app, self.settings.get("theme", theme.THEME_LIGHT))
+        # Подсветка синтаксиса создаётся с цветами темы — обновляем её.
+        self.editor.refresh_highlighting()
+        self.response.refresh_highlighting()
+
+    def _apply_proxy(self) -> None:
+        proxy = (self.settings.get("proxy") or "").strip()
+        self.session.proxies = {"http": proxy, "https": proxy} if proxy else {}
+
+    def edit_cookies(self) -> None:
+        CookiesDialog(self.session, self).exec()
+        self._save_cookies()
+
+    def _save_cookies(self) -> None:
+        if not self.settings.get("persist_cookies", True):
+            return
+        try:
+            self.storage.save_cookies(cookies.export_jar(self.session))
+        except OSError:
+            pass  # не критично: cookies просто не сохранятся
+
     def reset_config(self) -> None:
         reply = QtWidgets.QMessageBox.warning(
             self,
@@ -433,6 +504,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage("Конфигурация сброшена", 4000)
 
     # -- переименование элементов ------------------------------------------
+    def _on_folder_settings_changed(self, _folder) -> None:
+        """Обновить подсказку о наследовании для открытого запроса."""
+        current = self.editor.current_request()
+        if current is not None and self.current_ws is not None:
+            chain = inheritance.find_chain(self.current_ws, current) or []
+            self.editor.set_inherited_note(inheritance.describe(current, chain))
+
     def _on_item_renamed(self, obj) -> None:
         # Если переименован открытый запрос — обновим поле имени в редакторе.
         if obj is self.editor.current_request():
@@ -441,6 +519,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_request_selected(self, req) -> None:
         self.editor.set_request(req)
         self._refresh_known_variables()
+        # Показываем, что придёт из настроек папок.
+        if req is not None and self.current_ws is not None:
+            chain = inheritance.find_chain(self.current_ws, req) or []
+            self.editor.set_inherited_note(inheritance.describe(req, chain))
+        else:
+            self.editor.set_inherited_note([])
         # Показываем историю ответов выбранного запроса (если есть).
         history = self._history.get(req.id) if req is not None else None
         if history:
@@ -521,8 +605,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if req is None:
             self.status.showMessage("Выберите запрос для отправки", 3000)
             return
+        # Если таблица открыта в текстовом режиме, сначала применяем правки.
+        self.editor.commit_pending_edits()
+        # Применяем настройки папок (базовый URL, заголовки, авторизация).
+        effective, _chain = inheritance.resolve_in(
+            self.current_ws, req, self.current_ws.variables
+        )
         try:
-            method, url, kwargs = http_client.build_request_kwargs(req, self.current_ws.variables)
+            method, url, kwargs = http_client.build_request_kwargs(
+                effective, self.current_ws.variables
+            )
+        except FileNotFoundError as exc:
+            self.response.show_error(f"Файл для отправки не найден: {exc.filename}")
+            return
         except Exception as exc:  # ошибка сборки запроса
             self.response.show_error(f"Не удалось подготовить запрос: {exc}")
             return
@@ -531,16 +626,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Параметры выполнения уровня запроса.
-        kwargs["allow_redirects"] = req.follow_redirects
-        kwargs["verify"] = req.verify_ssl
-        if not req.verify_ssl:
+        kwargs["allow_redirects"] = effective.follow_redirects
+        kwargs["verify"] = effective.verify_ssl
+        if not effective.verify_ssl:
             try:
                 import urllib3
 
                 urllib3.disable_warnings()
             except Exception:
                 pass
-        timeout = req.timeout if req.timeout else self.timeout
+        timeout = effective.timeout if effective.timeout else self.timeout
+
+        # OAuth2 client credentials: токен получаем в фоновом потоке.
+        oauth_config = None
+        if http_client.needs_oauth(effective):
+            oauth_config = oauth.config_from(effective, self.current_ws.variables)
 
         self.response.show_loading()
         self.response.show_sent_request(method, url, kwargs)
@@ -550,7 +650,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_url_history(url)
 
         self._runner = RequestRunner(
-            method, url, kwargs, timeout=timeout, session=self.session, parent=self
+            method, url, kwargs, timeout=timeout, session=self.session,
+            oauth_config=oauth_config, parent=self,
         )
         self._runner.succeeded.connect(self._on_response)
         self._runner.failed.connect(self._on_request_error)
@@ -650,6 +751,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - имя задано Qt
         self._flush_save()
+        self._save_cookies()
         try:
             self.settings["window_geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
             self.storage.save_settings(self.settings)

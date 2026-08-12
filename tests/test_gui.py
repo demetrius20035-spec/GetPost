@@ -465,6 +465,273 @@ class TestAutosave(GuiTestCase):
         self.assertIn("НЕ СОХРАНЕНО", self.window.status.currentMessage())
 
 
+class TestFolderSettingsGui(GuiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.folder = models.Folder("API")
+        self.folder.base_url = "https://api.test/v1"
+        self.folder.headers = [{"enabled": True, "key": "X-Folder", "value": "1"}]
+        self.folder.auth_type = models.AUTH_BEARER
+        self.folder.auth_bearer_token = "FOLDER-TOKEN"
+        self.req = models.Request("Item")
+        self.req.url = "items"
+        self.req.auth_type = models.AUTH_INHERIT
+        self.folder.requests.append(self.req)
+        self.ws.folders.append(self.folder)
+        self.window.sidebar.set_workspace(self.ws)
+
+    def test_tree_marks_folder_with_settings(self):
+        item = self.find_item(self.folder)
+        self.assertIn("⚙", item.text(0))
+
+    def test_rename_keeps_settings_mark_out_of_name(self):
+        item = self.find_item(self.folder)
+        item.setText(0, "📁 Renamed ⚙")
+        self.assertEqual(self.folder.name, "Renamed")
+
+    def test_dialog_applies_settings(self):
+        from getpost_gui.views.dialogs import FolderSettingsDialog
+
+        plain = models.Folder("Plain")
+        dialog = FolderSettingsDialog(plain)
+        dialog.base_url.setText("https://new.test")
+        dialog.headers_table.set_items([{"enabled": True, "key": "X-New", "value": "2"}])
+        dialog.auth_editor.type_combo.setCurrentIndex(
+            dialog.auth_editor.type_combo.findData(models.AUTH_API_KEY)
+        )
+        dialog.auth_editor.api_key_name.setText("X-Key")
+        dialog.auth_editor.api_key_value.setText("V")
+        dialog.apply_to(plain)
+        self.assertEqual(plain.base_url, "https://new.test")
+        self.assertEqual(plain.headers[0]["key"], "X-New")
+        self.assertEqual(plain.auth_type, models.AUTH_API_KEY)
+        self.assertEqual(plain.auth_api_key_name, "X-Key")
+
+    def test_folder_settings_are_undoable(self):
+        from getpost_gui.views.dialogs import FolderSettingsDialog
+
+        original = self.folder.base_url
+        # Имитируем принятый диалог.
+        dialog = FolderSettingsDialog(self.folder)
+        dialog.base_url.setText("https://changed.test")
+        with self.window.controller.transaction("Настройки папки"):
+            dialog.apply_to(self.folder)
+        self.assertEqual(self.folder.base_url, "https://changed.test")
+        self.window.controller.undo_stack.undo()
+        restored = self.window.current_ws.folders[-1]
+        self.assertEqual(restored.base_url, original)
+
+    def test_inherited_note_shown_for_request(self):
+        self.window.sidebar.select_request(self.req)
+        self.window._on_request_selected(self.req)
+        self.assertTrue(self.window.editor.inherit_note.isVisible())
+        text = self.window.editor.inherit_note.text()
+        self.assertIn("API", text)
+
+
+class TestSendUsesInheritance(GuiTestCase):
+    def test_effective_request_used_on_send(self):
+        """Отправка должна использовать базовый URL и заголовки папки."""
+        from getpost_gui import inheritance
+
+        folder = models.Folder("API")
+        folder.base_url = "https://api.test"
+        folder.headers = [{"enabled": True, "key": "X-Folder", "value": "yes"}]
+        req = models.Request("Ping")
+        req.url = "ping"
+        folder.requests.append(req)
+        self.ws.folders.append(folder)
+        self.window.sidebar.set_workspace(self.ws)
+
+        effective, chain = inheritance.resolve_in(self.ws, req, self.ws.variables)
+        self.assertEqual(effective.url, "https://api.test/ping")
+        self.assertEqual(len(chain), 1)
+        keys = [h["key"] for h in effective.headers]
+        self.assertIn("X-Folder", keys)
+
+
+class TestGraphQLEditor(GuiTestCase):
+    def test_graphql_fields_sync(self):
+        req = self.window.editor.current_request()
+        editor = self.window.editor
+        index = editor.body_type_combo.findData(models.BODY_GRAPHQL)
+        editor.body_type_combo.setCurrentIndex(index)
+        editor.graphql_query_edit.setPlainText("{ me { id } }")
+        editor.graphql_vars_edit.setPlainText('{"a": 1}')
+        self.assertEqual(req.body_type, models.BODY_GRAPHQL)
+        self.assertEqual(req.body_graphql_query, "{ me { id } }")
+        self.assertEqual(req.body_graphql_variables, '{"a": 1}')
+
+    def test_graphql_page_selected(self):
+        editor = self.window.editor
+        editor.body_type_combo.setCurrentIndex(
+            editor.body_type_combo.findData(models.BODY_GRAPHQL)
+        )
+        self.assertEqual(editor.body_stack.currentIndex(), 4)
+
+
+class TestAuthEditorGui(GuiTestCase):
+    def test_api_key_stored_in_request(self):
+        req = self.window.editor.current_request()
+        editor = self.window.editor.auth_editor
+        editor.type_combo.setCurrentIndex(editor.type_combo.findData(models.AUTH_API_KEY))
+        editor.api_key_name.setText("X-Token")
+        editor.api_key_value.setText("V1")
+        self.assertEqual(req.auth_type, models.AUTH_API_KEY)
+        self.assertEqual(req.auth_api_key_name, "X-Token")
+
+    def test_oauth_fields_stored(self):
+        req = self.window.editor.current_request()
+        editor = self.window.editor.auth_editor
+        editor.type_combo.setCurrentIndex(editor.type_combo.findData(models.AUTH_OAUTH2_CC))
+        editor.oauth_token_url.setText("https://auth/token")
+        editor.oauth_client_id.setText("cid")
+        editor.oauth_scope.setText("read")
+        self.assertEqual(req.auth_type, models.AUTH_OAUTH2_CC)
+        self.assertEqual(req.auth_oauth2_token_url, "https://auth/token")
+        self.assertEqual(req.auth_oauth2_scope, "read")
+
+    def test_inherit_option_available_for_request(self):
+        editor = self.window.editor.auth_editor
+        self.assertGreaterEqual(editor.type_combo.findData(models.AUTH_INHERIT), 0)
+
+    def test_inherit_option_absent_for_folder(self):
+        from getpost_gui.views.dialogs import AuthEditor
+
+        folder_editor = AuthEditor(allow_inherit=False)
+        self.assertEqual(folder_editor.type_combo.findData(models.AUTH_INHERIT), -1)
+
+
+class TestBulkEdit(GuiTestCase):
+    def table(self):
+        return self.window.editor.headers_table
+
+    def test_to_text_and_back(self):
+        table = self.table()
+        table.set_items([
+            {"enabled": True, "key": "A", "value": "1"},
+            {"enabled": False, "key": "B", "value": "2"},
+        ])
+        table.bulk_toggle.setChecked(True)
+        text = table.bulk_edit.toPlainText()
+        self.assertIn("A: 1", text)
+        self.assertIn("# B: 2", text)  # выключенная пара помечена решёткой
+
+        table.bulk_edit.setPlainText("X: 9\n# Y: 8")
+        table.bulk_toggle.setChecked(False)
+        items = table.get_items()
+        self.assertEqual(items[0], {"enabled": True, "key": "X", "value": "9"})
+        self.assertEqual(items[1], {"enabled": False, "key": "Y", "value": "8"})
+
+    def test_equals_separator_supported(self):
+        table = self.table()
+        table.bulk_toggle.setChecked(True)
+        table.bulk_edit.setPlainText("a=1")
+        table.bulk_toggle.setChecked(False)
+        self.assertEqual(table.get_items()[0]["value"], "1")
+
+    def test_pasted_headers_with_colon_in_value(self):
+        table = self.table()
+        table.bulk_toggle.setChecked(True)
+        table.bulk_edit.setPlainText("Referer: https://x.io/a")
+        table.bulk_toggle.setChecked(False)
+        item = table.get_items()[0]
+        self.assertEqual(item["key"], "Referer")
+        self.assertEqual(item["value"], "https://x.io/a")
+
+    def test_commit_bulk_applies_and_closes(self):
+        table = self.table()
+        table.bulk_toggle.setChecked(True)
+        table.bulk_edit.setPlainText("Z: 1")
+        table.commit_bulk()
+        self.assertFalse(table.is_bulk_mode())
+        self.assertEqual(table.get_items()[0]["key"], "Z")
+
+    def test_editor_commits_before_send(self):
+        req = self.window.editor.current_request()
+        table = self.table()
+        table.bulk_toggle.setChecked(True)
+        table.bulk_edit.setPlainText("X-Bulk: 7")
+        self.window.editor.commit_pending_edits()
+        self.assertIn("X-Bulk", [h["key"] for h in req.headers])
+
+
+class TestThemeSwitching(GuiTestCase):
+    def test_apply_dark_theme(self):
+        from getpost_gui import theme
+
+        self.window.settings["theme"] = theme.THEME_DARK
+        self.window._apply_theme()
+        self.assertEqual(theme.current(), theme.THEME_DARK)
+        app = QtWidgets.QApplication.instance()
+        self.assertEqual(
+            app.palette().color(app.palette().ColorRole.Window).name(),
+            theme.DARK["window"],
+        )
+        # Возвращаем светлую, чтобы не влиять на другие тесты.
+        self.window.settings["theme"] = theme.THEME_LIGHT
+        self.window._apply_theme()
+
+    def test_settings_dialog_values(self):
+        from getpost_gui.views.dialogs import SettingsDialog
+        from getpost_gui import theme
+
+        dialog = SettingsDialog({"theme": theme.THEME_DARK, "timeout": 45, "proxy": "http://p:1"})
+        values = dialog.values()
+        self.assertEqual(values["theme"], theme.THEME_DARK)
+        self.assertEqual(values["timeout"], 45)
+        self.assertEqual(values["proxy"], "http://p:1")
+
+    def test_proxy_applied_to_session(self):
+        self.window.settings["proxy"] = "http://proxy.local:3128"
+        self.window._apply_proxy()
+        self.assertEqual(self.window.session.proxies["https"], "http://proxy.local:3128")
+        self.window.settings["proxy"] = ""
+        self.window._apply_proxy()
+        self.assertEqual(self.window.session.proxies, {})
+
+
+class TestCookiesGui(GuiTestCase):
+    def test_dialog_lists_and_clears(self):
+        from getpost_gui.views.dialogs import CookiesDialog
+
+        self.window.session.cookies.set("sid", "v", domain="example.com", path="/")
+        dialog = CookiesDialog(self.window.session)
+        self.assertEqual(dialog.table.rowCount(), 1)
+        dialog._clear_all()
+        self.assertEqual(dialog.table.rowCount(), 0)
+
+    def test_cookies_persist_on_close(self):
+        self.window.session.cookies.set("keep", "1", domain="example.com", path="/")
+        self.window._save_cookies()
+        self.assertTrue(any(c["name"] == "keep" for c in self.storage.load_cookies()))
+
+
+class TestDiffGui(GuiTestCase):
+    def _response(self, text, elapsed=10.0):
+        return ResponseData(
+            200, "OK", [("Content-Type", "application/json")], text, elapsed,
+            len(text), "http://x", "application/json", True, text.encode(),
+        )
+
+    def test_diff_dialog_reports_changes(self):
+        from getpost_gui.views.dialogs import DiffDialog
+
+        dialog = DiffDialog(self._response('{"a":1}'), self._response('{"a":2}', 20.0), 1)
+        report = dialog.view.toPlainText()
+        self.assertIn("Тело:", report)
+        self.assertIn('"a": 2', report)
+        self.assertIn("+10", report)
+
+    def test_diff_button_visible_only_with_history(self):
+        req = self.window.editor.current_request()
+        self.window._sending_req = req
+        self.window._on_response(self._response('{"a":1}'))
+        self.assertFalse(self.window.response.diff_btn.isVisible())
+        self.window._on_response(self._response('{"a":2}'))
+        self.assertTrue(self.window.response.diff_btn.isVisible())
+
+
 @unittest.skipUnless(QT_AVAILABLE, "Qt недоступен")
 class TestControllerUnit(unittest.TestCase):
     """Контроллер отдельно от окна."""

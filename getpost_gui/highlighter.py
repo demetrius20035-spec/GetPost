@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from typing import List, Tuple
 
+from . import theme
 from .qtcompat import QtGui
 
 
@@ -25,11 +26,12 @@ class JsonHighlighter(QtGui.QSyntaxHighlighter):
 
     def __init__(self, document):
         super().__init__(document)
-        key_fmt = _fmt("#0b7285", bold=True)
-        string_fmt = _fmt("#2b8a3e")
-        number_fmt = _fmt("#1864ab")
-        keyword_fmt = _fmt("#c2255c", bold=True)
-        punct_fmt = _fmt("#868e96")
+        palette = theme.syntax()
+        key_fmt = _fmt(palette["key"], bold=True)
+        string_fmt = _fmt(palette["string"])
+        number_fmt = _fmt(palette["number"])
+        keyword_fmt = _fmt(palette["keyword"], bold=True)
+        punct_fmt = _fmt(palette["punct"])
 
         self._rules: List[Tuple[re.Pattern, QtGui.QTextCharFormat]] = [
             # Ключ объекта: "ключ" перед двоеточием.
@@ -55,10 +57,11 @@ class XmlHighlighter(QtGui.QSyntaxHighlighter):
 
     def __init__(self, document):
         super().__init__(document)
-        self._tag_fmt = _fmt("#1864ab", bold=True)
-        self._attr_fmt = _fmt("#0b7285")
-        self._value_fmt = _fmt("#2b8a3e")
-        self._comment_fmt = _fmt("#868e96")
+        palette = theme.syntax()
+        self._tag_fmt = _fmt(palette["tag"], bold=True)
+        self._attr_fmt = _fmt(palette["attr"])
+        self._value_fmt = _fmt(palette["string"])
+        self._comment_fmt = _fmt(palette["comment"])
 
         self._rules: List[Tuple[re.Pattern, QtGui.QTextCharFormat]] = [
             (re.compile(r"</?[A-Za-z_][\w:.-]*"), self._tag_fmt),

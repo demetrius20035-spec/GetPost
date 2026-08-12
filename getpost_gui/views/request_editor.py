@@ -12,7 +12,8 @@ from typing import Optional
 from .. import models
 from ..highlighter import JsonHighlighter, XmlHighlighter
 from ..qtcompat import Qt, QtWidgets, Signal
-from ..variables import find_variables
+from ..variables import find_unresolved
+from .dialogs import AuthEditor
 from .widgets import KeyValueTable, monospace_font
 
 
@@ -77,6 +78,13 @@ class RequestEditor(QtWidgets.QWidget):
         self.var_warning.setVisible(False)
         layout.addWidget(self.var_warning)
 
+        # Что запрос берёт из настроек папки (базовый URL, заголовки, авторизация).
+        self.inherit_note = QtWidgets.QLabel("")
+        self.inherit_note.setWordWrap(True)
+        self.inherit_note.setStyleSheet("color: #868e96;")
+        self.inherit_note.setVisible(False)
+        layout.addWidget(self.inherit_note)
+
         # Вкладки
         self.tabs = QtWidgets.QTabWidget()
         self.params_table = KeyValueTable("Параметр", "Значение")
@@ -121,6 +129,7 @@ class RequestEditor(QtWidgets.QWidget):
         self.body_type_combo.addItem("Raw", models.BODY_RAW)
         self.body_type_combo.addItem("Form-data", models.BODY_FORM_DATA)
         self.body_type_combo.addItem("x-www-form-urlencoded", models.BODY_URLENCODED)
+        self.body_type_combo.addItem("GraphQL", models.BODY_GRAPHQL)
 
         self.raw_lang_combo = QtWidgets.QComboBox()
         self.raw_lang_combo.addItem("JSON", models.RAW_JSON)
@@ -153,55 +162,60 @@ class RequestEditor(QtWidgets.QWidget):
         # 3: urlencoded
         self.urlencoded_table = KeyValueTable("Поле", "Значение")
         self.body_stack.addWidget(self.urlencoded_table)
+        # 4: GraphQL — запрос и переменные
+        self.body_stack.addWidget(self._build_graphql_page())
 
         v.addWidget(self.body_stack, 1)
         return page
 
+    def _build_graphql_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        splitter = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+
+        query_box = QtWidgets.QWidget()
+        query_layout = QtWidgets.QVBoxLayout(query_box)
+        query_layout.setContentsMargins(0, 0, 0, 0)
+        query_layout.addWidget(QtWidgets.QLabel("Query:"))
+        self.graphql_query_edit = QtWidgets.QPlainTextEdit()
+        self.graphql_query_edit.setFont(monospace_font())
+        self.graphql_query_edit.setPlaceholderText("query { user(id: 1) { name } }")
+        query_layout.addWidget(self.graphql_query_edit, 1)
+        splitter.addWidget(query_box)
+
+        vars_box = QtWidgets.QWidget()
+        vars_layout = QtWidgets.QVBoxLayout(vars_box)
+        vars_layout.setContentsMargins(0, 0, 0, 0)
+        vars_layout.addWidget(QtWidgets.QLabel("Variables (JSON):"))
+        self.graphql_vars_edit = QtWidgets.QPlainTextEdit()
+        self.graphql_vars_edit.setFont(monospace_font())
+        self.graphql_vars_edit.setPlaceholderText('{"id": 1}')
+        self._graphql_vars_highlighter = JsonHighlighter(self.graphql_vars_edit.document())
+        vars_layout.addWidget(self.graphql_vars_edit, 1)
+        splitter.addWidget(vars_box)
+
+        splitter.setSizes([220, 120])
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(splitter)
+        return page
+
     def _build_auth_tab(self) -> QtWidgets.QWidget:
+        """Вкладка Auth: общий редактор (тот же используется для папок)."""
         page = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(page)
         v.setContentsMargins(6, 6, 6, 6)
-
-        row = QtWidgets.QHBoxLayout()
-        self.auth_type_combo = QtWidgets.QComboBox()
-        self.auth_type_combo.addItem("No Auth", models.AUTH_NONE)
-        self.auth_type_combo.addItem("Basic Auth", models.AUTH_BASIC)
-        self.auth_type_combo.addItem("Bearer Token", models.AUTH_BEARER)
-        row.addWidget(QtWidgets.QLabel("Тип:"))
-        row.addWidget(self.auth_type_combo)
-        row.addStretch(1)
-        v.addLayout(row)
-
-        self.auth_stack = QtWidgets.QStackedWidget()
-        # 0: none
-        none_page = QtWidgets.QLabel("Авторизация не используется.")
-        none_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        none_page.setStyleSheet("color: #868e96;")
-        self.auth_stack.addWidget(none_page)
-
-        # 1: basic
-        basic_page = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(basic_page)
-        self.basic_user_edit = QtWidgets.QLineEdit()
-        self.basic_pass_edit = QtWidgets.QLineEdit()
-        self.basic_pass_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.show_pass_check = QtWidgets.QCheckBox("Показать пароль")
-        form.addRow("Логин:", self.basic_user_edit)
-        form.addRow("Пароль:", self.basic_pass_edit)
-        form.addRow("", self.show_pass_check)
-        self.auth_stack.addWidget(basic_page)
-
-        # 2: bearer
-        bearer_page = QtWidgets.QWidget()
-        bform = QtWidgets.QFormLayout(bearer_page)
-        self.bearer_token_edit = QtWidgets.QLineEdit()
-        self.bearer_token_edit.setPlaceholderText("Токен")
-        bform.addRow("Token:", self.bearer_token_edit)
-        self.auth_stack.addWidget(bearer_page)
-
-        v.addWidget(self.auth_stack, 1)
-        v.addStretch(1)
+        self.auth_editor = AuthEditor(allow_inherit=True)
+        self.auth_editor.changed.connect(self._on_changed)
+        v.addWidget(self.auth_editor, 1)
         return page
+
+    def set_inherited_note(self, notes) -> None:
+        """Показать, какие настройки приходят из папок."""
+        if notes:
+            self.inherit_note.setText("Наследуется: " + "; ".join(notes))
+            self.inherit_note.setVisible(True)
+        else:
+            self.inherit_note.setVisible(False)
 
     def _build_capture_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -384,11 +398,8 @@ class RequestEditor(QtWidgets.QWidget):
         self.form_data_table.changed.connect(self._on_changed)
         self.urlencoded_table.changed.connect(self._on_changed)
 
-        self.auth_type_combo.currentIndexChanged.connect(self._on_auth_type_changed)
-        self.basic_user_edit.textChanged.connect(self._on_changed)
-        self.basic_pass_edit.textChanged.connect(self._on_changed)
-        self.bearer_token_edit.textChanged.connect(self._on_changed)
-        self.show_pass_check.toggled.connect(self._on_show_pass_toggled)
+        self.graphql_query_edit.textChanged.connect(self._on_changed)
+        self.graphql_vars_edit.textChanged.connect(self._on_changed)
 
     # -- загрузка / выгрузка модели ----------------------------------------
     def set_request(self, req: Optional[models.Request]) -> None:
@@ -408,7 +419,10 @@ class RequestEditor(QtWidgets.QWidget):
                 self.form_data_table.set_items([])
                 self.urlencoded_table.set_items([])
                 self.body_type_combo.setCurrentIndex(0)
-                self.auth_type_combo.setCurrentIndex(0)
+                self.graphql_query_edit.setPlainText("")
+                self.graphql_vars_edit.setPlainText("")
+                self.auth_editor.load(models.Request())
+                self.inherit_note.setVisible(False)
                 self.follow_check.setChecked(True)
                 self.verify_check.setChecked(True)
                 self.timeout_spin.setValue(0.0)
@@ -428,14 +442,12 @@ class RequestEditor(QtWidgets.QWidget):
             self.raw_edit.setPlainText(req.body_raw)
             self.form_data_table.set_items(req.body_form)
             self.urlencoded_table.set_items(req.body_form)
+            self.graphql_query_edit.setPlainText(req.body_graphql_query)
+            self.graphql_vars_edit.setPlainText(req.body_graphql_variables)
             self._update_body_stack()
             self._apply_raw_highlighter()
 
-            self._set_combo_data(self.auth_type_combo, req.auth_type)
-            self.basic_user_edit.setText(req.auth_basic_username)
-            self.basic_pass_edit.setText(req.auth_basic_password)
-            self.bearer_token_edit.setText(req.auth_bearer_token)
-            self._update_auth_stack()
+            self.auth_editor.load(req)
 
             self.follow_check.setChecked(req.follow_redirects)
             self.verify_check.setChecked(req.verify_ssl)
@@ -489,11 +501,10 @@ class RequestEditor(QtWidgets.QWidget):
             r.body_form = self.urlencoded_table.get_items()
         elif r.body_type == models.BODY_FORM_DATA:
             r.body_form = self.form_data_table.get_items()
+        r.body_graphql_query = self.graphql_query_edit.toPlainText()
+        r.body_graphql_variables = self.graphql_vars_edit.toPlainText()
 
-        r.auth_type = self.auth_type_combo.currentData()
-        r.auth_basic_username = self.basic_user_edit.text()
-        r.auth_basic_password = self.basic_pass_edit.text()
-        r.auth_bearer_token = self.bearer_token_edit.text()
+        self.auth_editor.store(r)
 
         r.follow_redirects = self.follow_check.isChecked()
         r.verify_ssl = self.verify_check.isChecked()
@@ -571,13 +582,6 @@ class RequestEditor(QtWidgets.QWidget):
         self._apply_raw_highlighter()
         self._on_changed()
 
-    def _on_auth_type_changed(self) -> None:
-        self._update_auth_stack()
-        self._on_changed()
-
-    def _on_show_pass_toggled(self, checked: bool) -> None:
-        mode = QtWidgets.QLineEdit.EchoMode.Normal if checked else QtWidgets.QLineEdit.EchoMode.Password
-        self.basic_pass_edit.setEchoMode(mode)
 
     # -- вспомогательное ----------------------------------------------------
     def _update_body_stack(self) -> None:
@@ -587,16 +591,23 @@ class RequestEditor(QtWidgets.QWidget):
             models.BODY_RAW: 1,
             models.BODY_FORM_DATA: 2,
             models.BODY_URLENCODED: 3,
+            models.BODY_GRAPHQL: 4,
         }
         self.body_stack.setCurrentIndex(mapping.get(data, 0))
         is_raw = data == models.BODY_RAW
         self.raw_lang_label.setVisible(is_raw)
         self.raw_lang_combo.setVisible(is_raw)
 
-    def _update_auth_stack(self) -> None:
-        data = self.auth_type_combo.currentData()
-        mapping = {models.AUTH_NONE: 0, models.AUTH_BASIC: 1, models.AUTH_BEARER: 2}
-        self.auth_stack.setCurrentIndex(mapping.get(data, 0))
+    def refresh_highlighting(self) -> None:
+        """Пересоздать подсветку после смены темы."""
+        self._apply_raw_highlighter()
+        self._graphql_vars_highlighter = JsonHighlighter(self.graphql_vars_edit.document())
+
+    def commit_pending_edits(self) -> None:
+        """Применить незакрытые режимы редактирования (таблицы «текстом»)."""
+        for table in (self.params_table, self.headers_table,
+                      self.form_data_table, self.urlencoded_table):
+            table.commit_bulk()
 
     def _apply_raw_highlighter(self) -> None:
         if self._raw_highlighter is not None:
@@ -622,31 +633,34 @@ class RequestEditor(QtWidgets.QWidget):
         self.send_btn.setToolTip("Прервать запрос" if sending else "Отправить запрос (Ctrl+Enter)")
 
     # -- подсветка неразрешённых переменных ---------------------------------
-    def _collect_used_variables(self) -> list:
-        """Все переменные, использованные в текущем запросе."""
+    def _collect_texts(self) -> list:
+        """Все тексты запроса, в которых могут быть переменные."""
         if self._req is None:
             return []
         req = self._req
-        texts = [req.url, req.body_raw, req.auth_bearer_token,
-                 req.auth_basic_username, req.auth_basic_password]
+        texts = [req.url, req.body_raw, req.body_graphql_query, req.body_graphql_variables,
+                 req.auth_bearer_token, req.auth_basic_username, req.auth_basic_password,
+                 req.auth_api_key_name, req.auth_api_key_value,
+                 req.auth_oauth2_token_url, req.auth_oauth2_client_id,
+                 req.auth_oauth2_client_secret, req.auth_oauth2_scope]
         for collection in (req.headers, req.params, req.body_form):
             for item in collection:
                 if item.get("enabled", True):
                     texts.append(str(item.get("key", "")))
                     texts.append(str(item.get("value", "")))
-        found = []
-        for text in texts:
-            for name in find_variables(text):
-                if name not in found:
-                    found.append(name)
-        return found
+        return texts
 
     def _update_var_warning(self) -> None:
         """Показать переменные, которых нет в активном окружении."""
         if self._req is None:
             self.var_warning.setVisible(False)
             return
-        unresolved = [n for n in self._collect_used_variables() if n not in self._known_vars]
+        known = {name: "" for name in self._known_vars}
+        unresolved = []
+        for text in self._collect_texts():
+            for name in find_unresolved(text, known):
+                if name not in unresolved:
+                    unresolved.append(name)
         if unresolved:
             names = ", ".join("{{" + n + "}}" for n in unresolved[:6])
             more = "…" if len(unresolved) > 6 else ""
