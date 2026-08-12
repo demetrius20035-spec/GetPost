@@ -1,0 +1,476 @@
+"""Модель данных GetPost.
+
+Иерархия: ``Workspace`` → ``Folder`` (до 2 уровней) → ``Request``.
+
+Все классы — обычный Python без зависимости от Qt и полностью
+сериализуются в JSON-совместимые словари (``to_dict`` / ``from_dict``),
+поэтому их легко тестировать и сохранять в файлы.
+"""
+from __future__ import annotations
+
+import uuid
+from typing import Any, Dict, List, Optional
+
+# --- HTTP-методы -----------------------------------------------------------
+HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+# Методы, для которых по умолчанию имеет смысл тело запроса.
+METHODS_WITH_BODY = {"POST", "PUT", "PATCH", "DELETE"}
+
+# --- Типы тела запроса -----------------------------------------------------
+BODY_NONE = "none"
+BODY_RAW = "raw"
+BODY_FORM_DATA = "form-data"
+BODY_URLENCODED = "x-www-form-urlencoded"
+BODY_GRAPHQL = "graphql"
+BODY_TYPES = [BODY_NONE, BODY_RAW, BODY_FORM_DATA, BODY_URLENCODED, BODY_GRAPHQL]
+
+# --- Язык "сырого" тела (для подсветки и Content-Type) ---------------------
+RAW_TEXT = "text"
+RAW_JSON = "json"
+RAW_XML = "xml"
+RAW_LANGS = [RAW_JSON, RAW_TEXT, RAW_XML]
+
+# --- Типы авторизации ------------------------------------------------------
+AUTH_NONE = "none"
+AUTH_BASIC = "basic"
+AUTH_BEARER = "bearer"
+AUTH_API_KEY = "apikey"
+AUTH_OAUTH2_CC = "oauth2_cc"   # client credentials (без браузерного флоу)
+# «Наследовать от папки» — значение по умолчанию для новых запросов.
+AUTH_INHERIT = "inherit"
+AUTH_TYPES = [AUTH_NONE, AUTH_INHERIT, AUTH_BASIC, AUTH_BEARER, AUTH_API_KEY, AUTH_OAUTH2_CC]
+
+# Куда подставлять API-ключ.
+APIKEY_IN_HEADER = "header"
+APIKEY_IN_QUERY = "query"
+APIKEY_LOCATIONS = [APIKEY_IN_HEADER, APIKEY_IN_QUERY]
+
+# Как передавать client_id/secret при получении токена OAuth2.
+OAUTH_SEND_BODY = "body"
+OAUTH_SEND_BASIC = "basic"
+OAUTH_SEND_MODES = [OAUTH_SEND_BODY, OAUTH_SEND_BASIC]
+
+# Поля авторизации — общие для запроса и папки (папка может задать авторизацию
+# для всех вложенных запросов).
+AUTH_FIELDS = (
+    "auth_type",
+    "auth_basic_username",
+    "auth_basic_password",
+    "auth_bearer_token",
+    "auth_api_key_name",
+    "auth_api_key_value",
+    "auth_api_key_location",
+    "auth_oauth2_token_url",
+    "auth_oauth2_client_id",
+    "auth_oauth2_client_secret",
+    "auth_oauth2_scope",
+    "auth_oauth2_send_as",
+)
+
+
+def init_auth(obj, auth_type: str = AUTH_NONE) -> None:
+    """Задать полям авторизации значения по умолчанию."""
+    obj.auth_type = auth_type
+    obj.auth_basic_username = ""
+    obj.auth_basic_password = ""
+    obj.auth_bearer_token = ""
+    obj.auth_api_key_name = ""
+    obj.auth_api_key_value = ""
+    obj.auth_api_key_location = APIKEY_IN_HEADER
+    obj.auth_oauth2_token_url = ""
+    obj.auth_oauth2_client_id = ""
+    obj.auth_oauth2_client_secret = ""
+    obj.auth_oauth2_scope = ""
+    obj.auth_oauth2_send_as = OAUTH_SEND_BODY
+
+
+def auth_to_dict(obj) -> Dict[str, Any]:
+    """Сериализовать поля авторизации объекта."""
+    return {name: getattr(obj, name) for name in AUTH_FIELDS}
+
+
+def auth_from_dict(obj, d: Dict[str, Any], default_type: str = AUTH_NONE) -> None:
+    """Прочитать поля авторизации из словаря."""
+    init_auth(obj, default_type)
+    obj.auth_type = _coerce_choice(d.get("auth_type"), AUTH_TYPES, default_type)
+    obj.auth_basic_username = str(d.get("auth_basic_username", ""))
+    obj.auth_basic_password = str(d.get("auth_basic_password", ""))
+    obj.auth_bearer_token = str(d.get("auth_bearer_token", ""))
+    obj.auth_api_key_name = str(d.get("auth_api_key_name", ""))
+    obj.auth_api_key_value = str(d.get("auth_api_key_value", ""))
+    obj.auth_api_key_location = _coerce_choice(
+        d.get("auth_api_key_location"), APIKEY_LOCATIONS, APIKEY_IN_HEADER
+    )
+    obj.auth_oauth2_token_url = str(d.get("auth_oauth2_token_url", ""))
+    obj.auth_oauth2_client_id = str(d.get("auth_oauth2_client_id", ""))
+    obj.auth_oauth2_client_secret = str(d.get("auth_oauth2_client_secret", ""))
+    obj.auth_oauth2_scope = str(d.get("auth_oauth2_scope", ""))
+    obj.auth_oauth2_send_as = _coerce_choice(
+        d.get("auth_oauth2_send_as"), OAUTH_SEND_MODES, OAUTH_SEND_BODY
+    )
+
+
+def defines_auth(obj) -> bool:
+    """Задаёт ли объект собственную авторизацию (а не «нет»/«наследовать»)."""
+    return getattr(obj, "auth_type", AUTH_NONE) not in (AUTH_NONE, AUTH_INHERIT)
+
+# Максимальная глубина вложенности папок (Workspace → 1 → 2).
+MAX_FOLDER_DEPTH = 2
+
+# Общепринятые заголовки (имя, значение по умолчанию) — для быстрого добавления.
+COMMON_HEADERS = [
+    ("Accept", "application/json"),
+    ("Content-Type", "application/json"),
+    ("Authorization", ""),
+    ("Accept-Language", "en-US"),
+    ("Accept-Encoding", "gzip, deflate"),
+    ("Cache-Control", "no-cache"),
+    ("User-Agent", "GetPost"),
+    ("X-Requested-With", "XMLHttpRequest"),
+]
+
+# Заголовки, которыми предзаполняется новый запрос (выключены — достаточно
+# поставить галочку, чтобы задействовать; не приходится вводить заново).
+DEFAULT_NEW_HEADERS = [
+    {"enabled": False, "key": "Accept", "value": "application/json"},
+    {"enabled": False, "key": "Content-Type", "value": "application/json"},
+    {"enabled": False, "key": "User-Agent", "value": "GetPost"},
+]
+
+
+def default_new_headers() -> List[Dict[str, Any]]:
+    """Свежая копия списка заголовков по умолчанию для нового запроса."""
+    return [dict(h) for h in DEFAULT_NEW_HEADERS]
+
+
+def new_id() -> str:
+    """Сгенерировать уникальный идентификатор."""
+    return uuid.uuid4().hex
+
+
+def _coerce_choice(value: Any, choices: List[str], default: str) -> str:
+    """Вернуть ``value`` если оно среди допустимых, иначе ``default``."""
+    return value if value in choices else default
+
+
+def _copy_kv_list(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Скопировать список пар «ключ-значение».
+
+    ``to_dict`` обязан возвращать независимый снимок: иначе изменения в
+    сериализованных данных (например, вычистка секретов при экспорте) утекали
+    бы обратно в живую модель.
+    """
+    return [dict(it) for it in items]
+
+
+def normalize_kv_list(raw: Any) -> List[Dict[str, Any]]:
+    """Нормализовать список пар «ключ-значение».
+
+    Каждый элемент приводится к виду
+    ``{"enabled": bool, "key": str, "value": str}``.
+    """
+    items: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            items.append(
+                {
+                    "enabled": bool(it.get("enabled", True)),
+                    "key": str(it.get("key", "")),
+                    "value": str(it.get("value", "")),
+                }
+            )
+    return items
+
+
+class Request:
+    """HTTP-запрос со всеми параметрами."""
+
+    def __init__(self, name: str = "New Request", id: Optional[str] = None):
+        self.id: str = id or new_id()
+        self.name: str = name
+        self.method: str = "GET"
+        self.url: str = ""
+        # Списки пар ключ-значение: [{"enabled", "key", "value"}, ...]
+        self.params: List[Dict[str, Any]] = []
+        self.headers: List[Dict[str, Any]] = []
+        # Тело запроса
+        self.body_type: str = BODY_NONE
+        self.body_raw: str = ""
+        self.body_raw_lang: str = RAW_JSON
+        # Используется и для form-data, и для x-www-form-urlencoded
+        self.body_form: List[Dict[str, Any]] = []
+        # GraphQL: запрос и переменные (JSON-текст)
+        self.body_graphql_query: str = ""
+        self.body_graphql_variables: str = ""
+        # Авторизация (набор полей общий с папкой)
+        init_auth(self, AUTH_NONE)
+        # Параметры выполнения (per-request). timeout=None → глобальный.
+        self.follow_redirects: bool = True
+        self.verify_ssl: bool = True
+        self.timeout: Optional[float] = None
+        # Правила извлечения значений из ответа в переменные окружения:
+        # [{"enabled", "name", "source", "expr"}, ...]
+        self.captures: List[Dict[str, Any]] = []
+
+    # -- сериализация -------------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        data = {
+            "id": self.id,
+            "name": self.name,
+            "method": self.method,
+            "url": self.url,
+            "params": _copy_kv_list(self.params),
+            "headers": _copy_kv_list(self.headers),
+            "body_type": self.body_type,
+            "body_raw": self.body_raw,
+            "body_raw_lang": self.body_raw_lang,
+            "body_form": _copy_kv_list(self.body_form),
+            "body_graphql_query": self.body_graphql_query,
+            "body_graphql_variables": self.body_graphql_variables,
+            "follow_redirects": self.follow_redirects,
+            "verify_ssl": self.verify_ssl,
+            "timeout": self.timeout,
+            "captures": _copy_kv_list(self.captures),
+        }
+        data.update(auth_to_dict(self))
+        return data
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Request":
+        r = cls(name=str(d.get("name", "New Request")), id=d.get("id"))
+        r.method = _coerce_choice(d.get("method"), HTTP_METHODS, "GET")
+        r.url = str(d.get("url", ""))
+        r.params = normalize_kv_list(d.get("params"))
+        r.headers = normalize_kv_list(d.get("headers"))
+        r.body_type = _coerce_choice(d.get("body_type"), BODY_TYPES, BODY_NONE)
+        r.body_raw = str(d.get("body_raw", ""))
+        r.body_raw_lang = _coerce_choice(d.get("body_raw_lang"), RAW_LANGS, RAW_JSON)
+        r.body_form = normalize_kv_list(d.get("body_form"))
+        r.body_graphql_query = str(d.get("body_graphql_query", ""))
+        r.body_graphql_variables = str(d.get("body_graphql_variables", ""))
+        # Для старых файлов значение по умолчанию — «нет авторизации»,
+        # поэтому поведение сохранённых запросов не меняется.
+        auth_from_dict(r, d, default_type=AUTH_NONE)
+        r.follow_redirects = bool(d.get("follow_redirects", True))
+        r.verify_ssl = bool(d.get("verify_ssl", True))
+        timeout = d.get("timeout")
+        r.timeout = float(timeout) if isinstance(timeout, (int, float)) else None
+        r.captures = normalize_captures(d.get("captures"))
+        return r
+
+    def clone(self, new_name: Optional[str] = None) -> "Request":
+        """Создать копию запроса с новым идентификатором."""
+        copy = Request.from_dict(self.to_dict())
+        copy.id = new_id()
+        copy.name = new_name if new_name is not None else f"{self.name} (копия)"
+        return copy
+
+
+class Folder:
+    """Папка: содержит вложенные папки и запросы.
+
+    Папка может задавать общие настройки для всего своего содержимого:
+    базовый URL, заголовки и авторизацию. Запросы применяют их, если сами
+    ничего не переопределяют (см. :mod:`getpost_gui.inheritance`).
+    """
+
+    def __init__(self, name: str = "New Folder", id: Optional[str] = None):
+        self.id: str = id or new_id()
+        self.name: str = name
+        # Общие настройки для вложенных запросов.
+        self.base_url: str = ""
+        self.headers: List[Dict[str, Any]] = []
+        init_auth(self, AUTH_NONE)
+        self.folders: List["Folder"] = []
+        self.requests: List[Request] = []
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = {
+            "id": self.id,
+            "name": self.name,
+            "base_url": self.base_url,
+            "headers": _copy_kv_list(self.headers),
+            "folders": [f.to_dict() for f in self.folders],
+            "requests": [r.to_dict() for r in self.requests],
+        }
+        data.update(auth_to_dict(self))
+        return data
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Folder":
+        f = cls(name=str(d.get("name", "New Folder")), id=d.get("id"))
+        f.base_url = str(d.get("base_url", ""))
+        f.headers = normalize_kv_list(d.get("headers"))
+        auth_from_dict(f, d, default_type=AUTH_NONE)
+        f.folders = [Folder.from_dict(x) for x in d.get("folders", []) if isinstance(x, dict)]
+        f.requests = [Request.from_dict(x) for x in d.get("requests", []) if isinstance(x, dict)]
+        return f
+
+    def has_settings(self) -> bool:
+        """Заданы ли у папки общие настройки (для пометки в дереве)."""
+        return bool(self.base_url) or bool(self.headers) or defines_auth(self)
+
+    def clone(self, new_name: Optional[str] = None) -> "Folder":
+        """Создать глубокую копию папки с новыми идентификаторами."""
+        copy = Folder.from_dict(self.to_dict())
+
+        def reassign(folder: "Folder") -> None:
+            folder.id = new_id()
+            for req in folder.requests:
+                req.id = new_id()
+            for sub in folder.folders:
+                reassign(sub)
+
+        reassign(copy)
+        copy.name = new_name if new_name is not None else f"{self.name} (копия)"
+        return copy
+
+
+DEFAULT_ENV = "Default"
+
+# Версия схемы файлов. 1 — одиночное поле variables; 2 — окружения, captures.
+SCHEMA_VERSION = 2
+
+# --- Источники для извлечения значений из ответа (capture) -----------------
+CAPTURE_JSON = "json"      # путь вида data.items[0].token
+CAPTURE_HEADER = "header"  # имя заголовка ответа
+CAPTURE_STATUS = "status"  # код статуса
+CAPTURE_BODY = "body"      # всё тело как текст
+CAPTURE_SOURCES = [CAPTURE_JSON, CAPTURE_HEADER, CAPTURE_STATUS, CAPTURE_BODY]
+
+
+def normalize_captures(raw: Any) -> List[Dict[str, Any]]:
+    """Нормализовать список правил извлечения переменных из ответа."""
+    items: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            items.append(
+                {
+                    "enabled": bool(it.get("enabled", True)),
+                    "name": str(it.get("name", "")),
+                    "source": _coerce_choice(it.get("source"), CAPTURE_SOURCES, CAPTURE_JSON),
+                    "expr": str(it.get("expr", "")),
+                }
+            )
+    return items
+
+
+class Workspace:
+    """Рабочее пространство — корень иерархии.
+
+    Поддерживает несколько именованных окружений (environments), каждое со
+    своим набором переменных. Активное окружение доступно через свойство
+    ``variables`` (для совместимости с остальным кодом).
+    """
+
+    def __init__(self, name: str = "My Workspace", id: Optional[str] = None):
+        self.id: str = id or new_id()
+        self.name: str = name
+        # Окружения: {"Default": {"base_url": "..."}, "Prod": {...}}
+        self.environments: Dict[str, Dict[str, str]] = {DEFAULT_ENV: {}}
+        self.active_env: str = DEFAULT_ENV
+        # Имена переменных, помеченных как секретные: маскируются в интерфейсе
+        # и по умолчанию не попадают в экспорт.
+        self.secret_vars: List[str] = []
+        self.folders: List[Folder] = []
+        self.requests: List[Request] = []
+        # Путь к файлу на диске (заполняется хранилищем, не сериализуется).
+        self.file_path: Optional[str] = None
+
+    # -- активное окружение / переменные ------------------------------------
+    @property
+    def variables(self) -> Dict[str, str]:
+        """Переменные активного окружения."""
+        return self.environments.setdefault(self.active_env, {})
+
+    @variables.setter
+    def variables(self, value: Dict[str, str]) -> None:
+        self.environments[self.active_env] = {str(k): str(v) for k, v in dict(value).items()}
+
+    def env_names(self) -> List[str]:
+        return list(self.environments.keys())
+
+    def set_active_env(self, name: str) -> None:
+        if name in self.environments:
+            self.active_env = name
+
+    def add_env(self, name: str) -> bool:
+        if name and name not in self.environments:
+            self.environments[name] = {}
+            return True
+        return False
+
+    def rename_env(self, old: str, new: str) -> bool:
+        if old in self.environments and new and new not in self.environments:
+            # Сохраняем порядок ключей.
+            self.environments = {
+                (new if k == old else k): v for k, v in self.environments.items()
+            }
+            if self.active_env == old:
+                self.active_env = new
+            return True
+        return False
+
+    def remove_env(self, name: str) -> bool:
+        if name in self.environments and len(self.environments) > 1:
+            del self.environments[name]
+            if self.active_env == name:
+                self.active_env = next(iter(self.environments))
+            return True
+        return False
+
+    # -- секретные переменные ----------------------------------------------
+    def is_secret(self, name: str) -> bool:
+        return name in self.secret_vars
+
+    def set_secret(self, name: str, secret: bool) -> None:
+        if secret and name not in self.secret_vars:
+            self.secret_vars.append(name)
+        elif not secret and name in self.secret_vars:
+            self.secret_vars.remove(name)
+
+    # -- сериализация -------------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "id": self.id,
+            "name": self.name,
+            # Копии, а не ссылки: снимок должен быть независим от модели.
+            "environments": {name: dict(v) for name, v in self.environments.items()},
+            "active_env": self.active_env,
+            "secret_vars": list(self.secret_vars),
+            "folders": [f.to_dict() for f in self.folders],
+            "requests": [r.to_dict() for r in self.requests],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Workspace":
+        ws = cls(name=str(d.get("name", "My Workspace")), id=d.get("id"))
+        envs = d.get("environments")
+        if isinstance(envs, dict) and envs:
+            ws.environments = {
+                str(k): {str(kk): str(vv) for kk, vv in (v or {}).items()}
+                for k, v in envs.items()
+                if isinstance(v, dict)
+            }
+            active = d.get("active_env")
+            ws.active_env = active if active in ws.environments else next(iter(ws.environments))
+        else:
+            # Миграция со старого формата (одиночное поле variables).
+            legacy = d.get("variables", {})
+            variables = {str(k): str(v) for k, v in legacy.items()} if isinstance(legacy, dict) else {}
+            ws.environments = {DEFAULT_ENV: variables}
+            ws.active_env = DEFAULT_ENV
+        if not ws.environments:
+            ws.environments = {DEFAULT_ENV: {}}
+            ws.active_env = DEFAULT_ENV
+        secrets = d.get("secret_vars")
+        if isinstance(secrets, list):
+            ws.secret_vars = [str(s) for s in secrets]
+        ws.folders = [Folder.from_dict(x) for x in d.get("folders", []) if isinstance(x, dict)]
+        ws.requests = [Request.from_dict(x) for x in d.get("requests", []) if isinstance(x, dict)]
+        return ws
